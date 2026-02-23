@@ -32,6 +32,10 @@ amp: False  # (bool) 自动混合精度（AMP）训练，选择项=[True, False]
 profile: False  # (bool) 在训练期间记录 ONNX 和 TensorRT 的速度以供日志使用
 freeze: None  # (int | list, optional) 冻结前 n 层，或在训练期间冻结层索引列表
 multi_scale: False  # (bool) 是否在训练期间使用多尺度
+# 在 Train settings 区域添加以下参数
+cache: False  # (bool | str) 图像缓存到RAM(True/'ram')或磁盘('disk')加速数据加载
+fraction: 1.0  # (float) 训练数据集使用比例 (1.0=全部)
+compile: False  # (bool | str) 启用torch.compile()后端='inductor'
 
 # 验证/测试设置 ----------------------------------------------------------------------------------------------------
 val: True  # (bool) 在训练期间进行验证/测试
@@ -44,6 +48,7 @@ max_det: 300  # (int) 每张图像的最大检测数量
 half: False  # (bool) 是否使用半精度（FP16）
 dnn: False  # (bool) 是否使用 OpenCV DNN 进行 ONNX 推理
 plots: True  # (bool) 在训练/验证期间是否保存图形和图像
+end2end: True # (bool, optional) 是否使用端到端头 (YOLO26/YOLOv10)
 
 # 预测设置 -----------------------------------------------------------------------------------------------------
 source:  # (str, optional) 图像或视频的源目录
@@ -96,5 +101,13 @@ copy_paste: 0.0  # (float) 分段复制粘贴（概率）
 copy_paste_mode: "flip"  # (str) 执行复制粘贴增强的方法（翻转、混合）
 auto_augment: randaugment  # (str) 分类的自动增强策略（randaugment、autoaugment、augmix）
 
-# 自定义配置文件 config.yaml ---------------------------------------------------------------------------------------------------
-cfg:  # (str, optional) 用于覆盖 defaults.yaml
+# Export settings ------------------------------------------------------------------------------------------------------
+format: torchscript  # (str) 目标格式: torchscript|onnx|openvino|engine|coreml|saved_model|tflite|etc
+keras: False  # (bool) 仅TF SavedModel; 启用Keras层
+optimize: False  # (bool) 仅TorchScript; 应用移动端优化
+int8: False  # (bool) INT8量化 (需要校准数据)
+dynamic: False  # (bool) 动态形状 (ONNX/TorchScript等)
+simplify: True  # (bool) ONNX/Engine; 运行图简化器
+opset:  # (int, optional) ONNX/Engine opset版本
+workspace:  # (float, optional) TensorRT工作空间大小(GiB)
+nms: False  # (bool) 导出时融合NMS到模型中

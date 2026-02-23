@@ -22,4 +22,6 @@ __all__ = (
     "torch_safe_load",
     "DetectionModel",
     "BaseModel",
+    "load_checkpoint",
 )
+

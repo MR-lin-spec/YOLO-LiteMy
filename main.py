@@ -3,7 +3,8 @@
 from yololite import YOLOLite
 
 # 加载预训练模型
-model = YOLOLite("yolo11n.pt")
+model = YOLOLite("yololite/cfg/yolo26.yaml")
+  # 如果有这个属性会显示yaml路径
 
 # 不使用预训练模型，会导致损失难以下降
 # model = YOLOLite("yololite3d/cfg/yolo11.yaml")

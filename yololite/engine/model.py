@@ -32,7 +32,7 @@ class YOLOLite(nn.Module):
 
     def __init__(
         self,
-        model: Union[str, Path] = "yolo11n.pt",
+        model: Union[str, Path] = "best_yolo26n.pt",
         task: str = None,
         verbose: bool = False,
     ) -> None:

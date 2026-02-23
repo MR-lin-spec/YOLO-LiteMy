@@ -58,6 +58,7 @@ from yololite.utils.checks import check_requirements
 from yololite.utils.loss import (
     E2EDetectLoss,
     v8DetectionLoss,
+    E2ELoss
 )
 from yololite.utils.ops import make_divisible
 from yololite.utils.plotting import feature_visualization
@@ -229,94 +230,178 @@ class BaseModel(nn.Module):
 
 
 class DetectionModel(BaseModel):
-    """YOLOv8 检测模型。"""
+    """YOLO detection model.
 
-    def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True):  # 模型，输入通道，类别数量
-        """使用给定的配置和参数初始化 YOLOv8 检测模型。"""
+    This class implements the YOLO detection architecture, handling model initialization, forward pass, augmented
+    inference, and loss computation for object detection tasks.
+
+    Attributes:
+        yaml (dict): Model configuration dictionary.
+        model (torch.nn.Sequential): The neural network model.
+        save (list): List of layer indices to save outputs from.
+        names (dict): Class names dictionary.
+        inplace (bool): Whether to use inplace operations.
+        end2end (bool): Whether the model uses end-to-end detection.
+        stride (torch.Tensor): Model stride values.
+
+    Methods:
+        __init__: Initialize the YOLO detection model.
+        _predict_augment: Perform augmented inference.
+        _descale_pred: De-scale predictions following augmented inference.
+        _clip_augmented: Clip YOLO augmented inference tails.
+        init_criterion: Initialize the loss criterion.
+
+    Examples:
+        Initialize a detection model
+        >>> model = DetectionModel("yolo26n.yaml", ch=3, nc=80)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
+        """Initialize the YOLO detection model with the given config and parameters.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Whether to display model information.
+        """
         super().__init__()
-        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # 配置字典
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
         if self.yaml["backbone"][0][2] == "Silence":
             LOGGER.warning(
-                "WARNING ⚠️ YOLOv9 `Silence` 模块已弃用，替换为 nn.Identity。"
-                "请删除本地 *.pt 文件并重新下载最新模型检查点。"
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
             )
             self.yaml["backbone"][0][2] = "nn.Identity"
 
-        # 定义模型
-        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # 输入通道
+        # Define model
+        self.yaml["channels"] = ch  # save channels
         if nc and nc != self.yaml["nc"]:
-            LOGGER.info(f"覆盖 model.yaml nc={self.yaml['nc']} 为 nc={nc}")
-            self.yaml["nc"] = nc  # 覆盖 YAML 值
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # 模型，保存列表
-        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # 默认名称字典
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
-        self.end2end = getattr(self.model[-1], "end2end", False)
 
-        # 构建步幅
+        # Build strides
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # 包括所有 Detect 子类，如 Segment、Pose、OBB、WorldDetect
-            s = 256  # 2x 最小步幅
+        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+            s = 256  # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
-                """执行通过模型的前向传播，处理不同 Detect 子类类型。"""
+                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
+                output = self.forward(x)
                 if self.end2end:
-                    return self.forward(x)["one2many"]
-                return self.forward(x)
+                    output = output["one2many"]
+                return output["feats"]
 
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # 前向传播
+            self.model.eval()  # Avoid changing batch statistics until training begins
+            m.training = True  # Setting it to True to properly return strides
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
-            m.bias_init()  # 仅运行一次
+            self.model.train()  # Set model back to training(default) mode
+            m.bias_init()  # only run once
         else:
-            self.stride = torch.Tensor([32])  # 默认步幅，即 RTDETR
+            self.stride = torch.Tensor([32])  # default stride, e.g., RTDETR
 
-        # 初始化权重，偏置
+        # Init weights, biases
         initialize_weights(self)
         if verbose:
+            self.info()
             LOGGER.info("")
 
+    @property
+    def end2end(self):
+        """Return whether the model uses end-to-end NMS-free detection."""
+        return getattr(self.model[-1], "end2end", False)
+
+    @end2end.setter
+    def end2end(self, value):
+        """Override the end-to-end detection mode."""
+        self.set_head_attr(end2end=value)
+
+    def set_head_attr(self, **kwargs):
+        """Set attributes of the model head (last layer).
+
+        Args:
+            **kwargs: Arbitrary keyword arguments representing attributes to set.
+        """
+        head = self.model[-1]
+        for k, v in kwargs.items():
+            if not hasattr(head, k):
+                LOGGER.warning(f"Head has no attribute '{k}'.")
+                continue
+            setattr(head, k, v)
+
     def _predict_augment(self, x):
-        """对输入图像 x 执行增强并返回增强的推理和训练输出。"""
+        """Perform augmentations on input image x and return augmented inference and train outputs.
+
+        Args:
+            x (torch.Tensor): Input image tensor.
+
+        Returns:
+            (tuple[torch.Tensor, None]): Augmented inference output and None for train output.
+        """
         if getattr(self, "end2end", False) or self.__class__.__name__ != "DetectionModel":
-            LOGGER.warning("WARNING ⚠️ 模型不支持 'augment=True'，回退到单尺度预测。")
+            LOGGER.warning("Model does not support 'augment=True', reverting to single-scale prediction.")
             return self._predict_once(x)
-        img_size = x.shape[-2:]  # 高度，宽度
-        s = [1, 0.83, 0.67]  # 缩放
-        f = [None, 3, None]  # 翻转（2-上下翻转，3-左右翻转）
-        y = []  # 输出
+        img_size = x.shape[-2:]  # height, width
+        s = [1, 0.83, 0.67]  # scales
+        f = [None, 3, None]  # flips (2-ud, 3-lr)
+        y = []  # outputs
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = super().predict(xi)[0]  # 前向传播
+            yi = super().predict(xi)[0]  # forward
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
-        y = self._clip_augmented(y)  # 裁剪增强的尾部
-        return torch.cat(y, -1), None  # 增强的推理，训练
+        y = self._clip_augmented(y)  # clip augmented tails
+        return torch.cat(y, -1), None  # augmented inference, train
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
-        """对增强推理后的预测进行反缩放（逆操作）。"""
-        p[:, :4] /= scale  # 反缩放
+        """De-scale predictions following augmented inference (inverse operation).
+
+        Args:
+            p (torch.Tensor): Predictions tensor.
+            flips (int | None): Flip type (None=none, 2=ud, 3=lr).
+            scale (float): Scale factor.
+            img_size (tuple): Original image size (height, width).
+            dim (int): Dimension to split at.
+
+        Returns:
+            (torch.Tensor): De-scaled predictions.
+        """
+        p[:, :4] /= scale  # de-scale
         x, y, wh, cls = p.split((1, 1, 2, p.shape[dim] - 4), dim)
         if flips == 2:
-            y = img_size[0] - y  # 反翻转上下
+            y = img_size[0] - y  # de-flip ud
         elif flips == 3:
-            x = img_size[1] - x  # 反翻转左右
+            x = img_size[1] - x  # de-flip lr
         return torch.cat((x, y, wh, cls), dim)
 
     def _clip_augmented(self, y):
-        """裁剪 YOLO 增强推理的尾部。"""
-        nl = self.model[-1].nl  # 检测层数量 (P3-P5)
-        g = sum(4**x for x in range(nl))  # 网格点
-        e = 1  # 排除层计数
-        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))  # 索引
-        y[0] = y[0][..., :-i]  # 大
-        i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # 索引
-        y[-1] = y[-1][..., i:]  # 小
+        """Clip YOLO augmented inference tails.
+
+        Args:
+            y (list[torch.Tensor]): List of detection tensors.
+
+        Returns:
+            (list[torch.Tensor]): Clipped detection tensors.
+        """
+        nl = self.model[-1].nl  # number of detection layers (P3-P5)
+        g = sum(4**x for x in range(nl))  # grid points
+        e = 1  # exclude layer count
+        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))  # indices
+        y[0] = y[0][..., :-i]  # large
+        i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
+        y[-1] = y[-1][..., i:]  # small
         return y
 
     def init_criterion(self):
-        """初始化 DetectionModel 的损失标准。"""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        """Initialize the loss criterion for the DetectionModel."""
+        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
 # 函数 ------------------------------------------------------------------------------------------------------------
@@ -522,114 +607,107 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
     return model, ckpt
 
 
-def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
-    """将 YOLO 模型.yaml 字典解析为 PyTorch 模型。"""
+def parse_model(d, ch, verbose=True):
+    """Parse a YOLO model.yaml dictionary into a PyTorch model.
+
+    Args:
+        d (dict): Model dictionary.
+        ch (int): Input channels.
+        verbose (bool): Whether to print model details.
+
+    Returns:
+        (torch.nn.Sequential): PyTorch model.
+        (list): Sorted list of layer indices whose outputs need to be saved.
+    """
     import ast
 
-    # 参数
-    legacy = True  # 向后兼容 v3/v5/v8/v9 模型
+    # Args
+    legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
+    
+    # [修改点 1] 新增 reg_max 和 end2end 参数获取
     nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
+    reg_max = d.get("reg_max", 16)
+    end2end = d.get("end2end", False)
+    
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
+    scale = d.get("scale")
     if scales:
-        scale = d.get("scale")
         if not scale:
-            scale = tuple(scales.keys())[0]
-            LOGGER.warning(f"WARNING ⚠️ 未传递模型缩放，假设 scale='{scale}'。")
+            scale = next(iter(scales.keys()))
+            LOGGER.warning(f"no model scale passed. Assuming scale='{scale}'.")
         depth, width, max_channels = scales[scale]
 
     if act:
-        Conv.default_act = eval(act)  # 重新定义默认激活，即 Conv.default_act = nn.SiLU()
+        Conv.default_act = eval(act)  # redefine default activation
         if verbose:
-            LOGGER.info(f"{colorstr('activation:')} {act}")  # 打印
+            LOGGER.info(f"{colorstr('activation:')} {act}")
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
+    
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    
+    # [修改点 2] 定义基础模块集合，提高可读性
+    base_modules = frozenset({
+        Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck,
+        SPP, SPPF, C2fPSA, C2PSA, DWConv, Focus, BottleneckCSP,
+        C1, C2, C2f, C3k2, RepNCSPELAN4, ELAN1, ADown, AConv,
+        SPPELAN, C2fAttn, C3, C3TR, C3Ghost, C3x, RepC3, PSA,
+        SCDown, C2fCIB, nn.ConvTranspose2d, DWConvTranspose2d
+    })
+    
+    # 定义需要重复次数参数的模块集合
+    repeat_modules = frozenset({
+        BottleneckCSP, C1, C2, C2f, C3k2, C2fAttn, C3, C3TR,
+        C3Ghost, C3x, RepC3, C2fPSA, C2fCIB, C2PSA
+    })
+
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]  # 获取模块
+        # 动态获取模块类
+        m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]
+        
+        # 处理 args 中的字符串参数
         for j, a in enumerate(args):
             if isinstance(a, str):
                 try:
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
                 except ValueError:
                     pass
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # 深度增益
-        if m in {
-            Conv,
-            ConvTranspose,
-            GhostConv,
-            Bottleneck,
-            GhostBottleneck,
-            SPP,
-            SPPF,
-            C2fPSA,
-            C2PSA,
-            DWConv,
-            Focus,
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            RepNCSPELAN4,
-            ELAN1,
-            ADown,
-            AConv,
-            SPPELAN,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            C3x,
-            RepC3,
-            PSA,
-            SCDown,
-            C2fCIB,
-            C3x,
-            nn.ConvTranspose2d,
-            DWConvTranspose2d,
-        }:
+        
+        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        
+        if m in base_modules:
             c1, c2 = ch[f], args[0]
-            if c2 != nc:  # 如果 c2 不等于类别数量（即 Classify() 输出）
+            if c2 != nc:  # if c2 != nc (e.g., Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
+            
+            # 特殊模块参数调整 (C2fAttn)
             if m is C2fAttn:
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)  # 嵌入通道
-                args[2] = int(
-                    max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2]
-                )  # num heads
+                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
+                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
 
             args = [c1, c2, *args[1:]]
-            if m in {
-                BottleneckCSP,
-                C1,
-                C2,
-                C2f,
-                C3k2,
-                C2fAttn,
-                C3,
-                C3TR,
-                C3Ghost,
-                C3x,
-                RepC3,
-                C2fPSA,
-                C2fCIB,
-                C2PSA,
-            }:
-                args.insert(2, n)  # 重复次数
+            
+            # 处理重复模块
+            if m in repeat_modules:
+                args.insert(2, n)  # number of repeats
                 n = 1
-            if m is C3k2:  # 对于 M/L/X 尺寸
+            
+            # C3k2 特定逻辑
+            if m is C3k2:
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
+                    
         elif m is AIFI:
             args = [ch[f], *args]
-        elif m in {HGStem, HGBlock}:
+        elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
             if m is HGBlock:
-                args.insert(4, n)  # 重复次数
+                args.insert(4, n)
                 n = 1
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
@@ -637,10 +715,24 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, ImagePoolingAttn}:
-            args.append([ch[x] for x in f])
-            if m in {Detect}:
-                m.legacy = legacy
+        
+        # [修改点 3 & 4] 重点修复：Detect 和 ImagePoolingAttn 的处理逻辑
+        elif m is Detect:
+            # 1. 添加 reg_max, end2end, 和输入通道列表
+            # 顺序非常重要，必须与 Detect 类的 __init__ 签名一致
+            args.extend([reg_max, end2end, [ch[x] for x in f]])
+            # 2. 设置 legacy 标志
+            m.legacy = legacy
+            # 3. 输出通道计算 (Detect 层通常不改变通道用于后续层，但为了日志一致性)
+            c2 = ch[f[-1]] if isinstance(f, list) else ch[f] 
+            
+        elif m is ImagePoolingAttn:
+            # 假设 ImagePoolingAttn 的签名为 __init__(self, channels, ... ) 或类似
+            # 将通道列表作为第二个参数插入 (index 1)，通常紧跟在自身通道或其他配置之后
+            # 如果具体实现不同，请调整 insert 的索引
+            args.insert(1, [ch[x] for x in f])
+            c2 = ch[f[-1]]
+            
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]
@@ -648,21 +740,26 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is CBFuse:
             c2 = ch[f[-1]]
         else:
+            # 其他未明确处理的模块，默认保持输入通道
             c2 = ch[f]
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # 模块
-        t = str(m)[8:-2].replace("__main__.", "")  # 模块类型
-        m_.np = sum(x.numel() for x in m_.parameters())  # 参数数量
-        m_.i, m_.f, m_.type = i, f, t  # 附加索引、'from' 索引、类型
+        # 实例化模块
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        t = str(m)[8:-2].replace("__main__.", "")
+        m_.np = sum(x.numel() for x in m_.parameters())
+        m_.i, m_.f, m_.type = i, f, t
+        
         if verbose:
-            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # 打印
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # 添加到保存列表
+            LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")
+        
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
+        
         if i == 0:
             ch = []
         ch.append(c2)
+        
     return nn.Sequential(*layers), sorted(save)
-
 
 def yaml_model_load(path):
     """从 YAML 文件加载 YOLOv8 模型。"""
