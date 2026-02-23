@@ -63,6 +63,11 @@ class AutoBackend(nn.Module):
         pt = (w.split('.')[1] == 'pt')
         fp16 &= True
         model, metadata, task = None, None, None
+         # 如果是 TorchScript 模型，设置为 True
+        if isinstance(weights, torch.nn.Module) and hasattr(weights, '_c'):
+            self.jit = True
+        else:
+            self.jit = False
 
         # 设置设备
         cuda = torch.cuda.is_available() and device.type != "cpu"  # 使用 CUDA
@@ -155,11 +160,23 @@ class AutoBackend(nn.Module):
         return torch.tensor(x).to(self.device) if isinstance(x, np.ndarray) else x
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
-        """通过使用虚拟输入运行一次前向传播来预热模型。"""
-        import torchvision  # noqa（导入此处以便 torchvision 导入时间不记录在后处理时间中）
-
-        warmup_types = self.pt, self.nn_module
-        if any(warmup_types) and (self.device.type != "cpu"):
-            im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # 输入
-            for _ in range(2 if self.jit else 1):
-                self.forward(im)  # 预热
+        """模型预热。"""
+        # ✅ 确保 imgsz 是 4 维 (batch, channels, height, width)
+        if len(imgsz) == 2:  # (height, width)
+            imgsz = (1, 3, imgsz[0], imgsz[1])
+        elif len(imgsz) == 3:  # (batch, channels, size) 或 (batch, height, width)
+            if imgsz[1] == 3 or imgsz[1] == 1:  # 已有 channels
+                imgsz = (imgsz[0], imgsz[1], imgsz[2], imgsz[2])
+            else:  # (batch, height, width)
+                imgsz = (imgsz[0], 3, imgsz[1], imgsz[2])
+        elif len(imgsz) == 4:
+            pass  # 已经是正确的格式
+        
+        # ✅ 安全访问 jit 属性
+        warmup_iters = 2 if getattr(self, 'jit', False) else 1
+        for _ in range(warmup_iters):
+            # ✅ 创建正确的输入张量
+            im = torch.zeros(*imgsz).to(self.device)
+            if hasattr(self, 'fp16') and self.fp16:
+                im = im.half()
+            self.forward(im)  # 预热

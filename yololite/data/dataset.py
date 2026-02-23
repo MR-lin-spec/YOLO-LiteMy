@@ -307,7 +307,7 @@ class YOLODataset(Dataset):
                 LOGGER.info("\n".join(cache["msgs"]))  # 打印警告信息
 
         # 读取缓存
-        [cache.pop(k) for k in ("hash", "version", "msgs")]  # 移除无用项
+        [cache.pop(k,None) for k in ("hash", "version", "msgs")]  # 移除无用项
         labels = cache["labels"]  # 获取标签信息
         if not labels:
             LOGGER.warning(f"警告 ⚠️ 在 {cache_path} 中未找到任何标签，训练可能无法正常工作。")

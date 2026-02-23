@@ -134,7 +134,7 @@ class DetectionValidator:
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()
-            model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz))  # 预热
+            model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))
 
         dt = (
             Profile(device=self.device),
@@ -301,15 +301,21 @@ class DetectionValidator:
         self.is_lvis = isinstance(val, str) and "lvis" in val and not self.is_coco  # 是 LVIS
         self.class_map = [i for i in range(1, 91)] if self.is_coco else list(range(len(model.names)))
         self.args.save_json |= self.args.val and (self.is_coco or self.is_lvis) and not self.training  # 运行最终验证
-        self.names = model.names
-        self.nc = len(model.names)
+        
+        # ✅ 修改开始：确保 self.names 是字典格式
+        if isinstance(model.names, list):
+            self.names = {i: name for i, name in enumerate(model.names)}
+        else:
+            self.names = model.names
+        # ✅ 修改结束
+        
+        self.nc = len(self.names)
         self.metrics.names = self.names
         self.metrics.plot = self.args.plots
         self.confusion_matrix = ConfusionMatrix(nc=self.nc, conf=self.args.conf)
         self.seen = 0
         self.jdict = []
         self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
-
     def update_metrics(self, preds, batch):
         """更新指标。"""
         for si, pred in enumerate(preds):

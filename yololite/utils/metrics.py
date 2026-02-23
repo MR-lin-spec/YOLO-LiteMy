@@ -549,8 +549,14 @@ def ap_per_class(
 
     # Compute F1 (harmonic mean of precision and recall)
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
-    names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
-    names = dict(enumerate(names))  # to dict
+    # ✅ 修改为（兼容列表和字典）
+    if isinstance(names, dict):
+        names_list = [v for k, v in names.items() if int(k) in unique_classes]
+    elif isinstance(names, list):
+        names_list = [names[int(i)] for i in unique_classes if int(i) < len(names)]
+    else:
+        names_list = [str(int(i)) for i in unique_classes]
+    names = dict(enumerate(names_list))  # to dict
     if plot:
         plot_pr_curve(x, prec_values, ap, save_dir / f"{prefix}PR_curve.png", names, on_plot=on_plot)
         plot_mc_curve(x, f1_curve, save_dir / f"{prefix}F1_curve.png", names, ylabel="F1", on_plot=on_plot)
