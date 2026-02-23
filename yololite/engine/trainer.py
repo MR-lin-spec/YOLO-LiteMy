@@ -261,7 +261,9 @@ class DetectionTrainer:
                     )
 
                 # 反向传播
-                self.scaler.scale(self.loss).backward()  # 缩放损失并反向传播
+                if not self.loss.dim() == 0:  # 检查是否为标量
+                    self.loss = self.loss.sum()  # 或 .mean()
+                self.scaler.scale(self.loss).backward()
 
                 # 优化
                 if ni - last_opt_step >= self.accumulate:  # 检查是否达到优化条件

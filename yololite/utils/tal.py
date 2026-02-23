@@ -350,7 +350,7 @@ def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
     return torch.cat((x1y1, x2y2), dim)  # xyxy 边界框
 
 
-def bbox2dist(anchor_points, bbox, reg_max):
+def bbox2dist(anchor_points, bbox, reg_max=1):
     """将边界框 (xyxy) 转换为距离 (ltrb)。"""
     x1y1, x2y2 = bbox.chunk(2, -1)
     return torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1).clamp_(0, reg_max - 0.01)  # 距离 (lt, rb)

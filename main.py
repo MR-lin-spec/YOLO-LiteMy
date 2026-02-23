@@ -1,7 +1,8 @@
 # YOLO-Lite 🚀
 
 from yololite import YOLOLite
-
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端，必须在import pyplot之前
 # 加载预训练模型
 model = YOLOLite("yololite/cfg/yolo26.yaml")
   # 如果有这个属性会显示yaml路径

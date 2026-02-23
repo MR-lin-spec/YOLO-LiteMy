@@ -67,6 +67,7 @@ from yololite.utils.torch_utils import (
     fuse_deconv_and_bn,
     initialize_weights,
     intersect_dicts,
+    model_info,
     scale_img,
     time_sync,
 )
@@ -176,7 +177,15 @@ class BaseModel(nn.Module):
         LOGGER.info(f"{dt[-1]:10.2f} {flops:10.2f} {m.np:10.0f}  {m.type}")
         if c:
             LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+    def info(self, detailed=False, verbose=True, imgsz=640):
+        """Print model information.
 
+        Args:
+            detailed (bool): If True, prints out detailed information about the model.
+            verbose (bool): If True, prints out the model information.
+            imgsz (int): The size of the image used for computing model information.
+        """
+        return model_info(self, detailed=detailed, verbose=verbose, imgsz=imgsz)
     def _apply(self, fn):
         """
         将函数应用于模型中所有不是参数或注册缓冲区的张量。
