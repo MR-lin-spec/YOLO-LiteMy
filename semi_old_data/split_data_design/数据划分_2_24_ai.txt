@@ -1,0 +1,45 @@
+假设你是一名YOLO工程师，现在你的文件路径如下
+其中train\images下有对应的图片
+
+请你按类别，均匀划分图片，其中使用命令行制定比例
+划分后的图片存放在相同目录，unlabel_image\下，制作对应的yaml文件,格式如下
+
+path: 
+is_unlabel: True
+val:
+train: 
+
+其中train目录是存放子目录的地方，path目录是主目录
+
+# voc.yaml
+path: D:\YOLO_Project\VOCtrainval\VOCdevkit\YOLO2012
+
+train: train\images  
+val: val\images
+# test: test/images  # 如果需要测试集
+
+# 类别数量
+nc: 20
+
+# 类别名称 (必须全小写，与 transform.py 一致)
+names:
+  0: aeroplane
+  1: bicycle
+  2: boat
+  3: bus
+  4: car
+  5: motorbike
+  6: train
+  7: bottle
+  8: chair
+  9: diningtable
+  10: pottedplant
+  11: sofa
+  12: tvmonitor
+  13: bird
+  14: cat
+  15: cow
+  16: dog
+  17: horse
+  18: sheep
+  19: person

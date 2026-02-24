@@ -1,4 +1,4 @@
 path: D:\Dataset\data\data
 is_unlabel: True
-train: images\train  # train images (relative to 'path')
 val:
+train: images\train  # train images (relative to 'path')

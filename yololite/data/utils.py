@@ -139,8 +139,8 @@ def check_det_dataset(dataset):
 
     # 检查关键字段
     for k in "train", "val":  # 对于训练和验证
-        if k not in data:  # 检查是否包含必需的关键字
-            if k != "val" or "validation" not in data:  # 验证只有在数据缺失时才抛出异常
+        if k not in data:  # 如果是有标签数据集检查是否包含必需的关键字
+            if k != "val" or "validation" not in data :  # 验证只有在数据缺失时才抛出异常
                 raise SyntaxError(
                     emojis(f"{dataset} '{k}:' 键缺失 ❌.\n'train' 和 'val' 在所有数据 YAML 中都是必需的。")
                 )

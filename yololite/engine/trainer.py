@@ -40,7 +40,7 @@ from yololite.utils.torch_utils import (
     select_device,
     strip_optimizer
 )
-
+from yololite.utils.unsupervised_loss import YOLO26ConsistencyLoss,IOUloss
 class DetectionTrainer:
     """
     属性：
@@ -227,6 +227,14 @@ class DetectionTrainer:
             decay=weight_decay,
             iterations=iterations,
         )
+        self.consistent_loss = YOLO26ConsistencyLoss(
+        box_weight=1.0,
+        cls_weight=1.0,
+        obj_weight=0.5,
+        temperature=1.0,
+        confidence_threshold=0.25,
+        iou_type="ciou",
+        )
         # 设置学习率调度器
         self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False  # 提前停止
@@ -293,29 +301,37 @@ class DetectionTrainer:
 
                 # 前向传播
                 with autocast(self.amp):  # 自动混合精度
+                    #学生模型和教师模型预测
                     if unlabelbatch is not None:  # 混合训练
-                        preds_teacher= self.ema.ema.predict(unlabelbatch['img']) # 预测
-                        print("无标签测试成功")
-                    else:  # 单标签训练
-                        preds = self.model(batch)
+                        teacher_preds= self.ema.ema.predict(unlabelbatch['img']) # 预测
+                   
                     batch = self.preprocess_batch(batch)  # 预处理批次
-                    self.loss, self.loss_items = self.model(batch)  # 计算损失
-                    print("模型输出：", self.model(batch))
-                    test_student_pred=self.model.forward(batch["img"]) # 模型前向传播得到学生模型的预测结果
+                    #计算无监督损失
+                    student_preds=self.model.forward(batch["img"]) # 模型前向传播得到学生模型的预测结果
+                    unsupervise_loss, unsupervise_loss_dict = self.consistent_loss(student_preds, teacher_preds)
+                    print("无监督损失：", unsupervise_loss)
+                    #如果小于制定轮数，采用有监督，否则采用无监督
+                    if epoch<20:
+                        self.loss, self.loss_items = self.model(batch)  # 计算损失
+                    else:
+                        self.loss, self.loss_items=unsupervise_loss, unsupervise_loss_dict
+                    #print("模型输出：", self.model(batch))
+                   
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
-                    test_ema=self.ema.ema.predict(batch['img'])
-                    print("模型测试输出：", test_ema)
-                    test_result_loss=self.model.criterion(test_ema,batch) #也可以模仿相关写法，重新编写无监督损失
-                    print("模型测试损失：", test_result_loss)
-                    update_ema=self.ema.update(self.model)# 由于ema的update方法是没有返回值的，所以是None
-                    print("ema测试输出：", test_ema)
+                    
+                    #print("模型测试损失：", test_result_loss)
+                    #update_ema=self.ema.update(self.model)# 由于ema的update方法是没有返回值的，所以是None
                 # 反向传播
                 if not self.loss.dim() == 0:  # 检查是否为标量
                     self.loss = self.loss.sum()  # 或 .mean()
-                self.scaler.scale(self.loss).backward()
+               
+                if not unsupervise_loss.dim() == 0:  # 检查是否为标量
+                    unsupervise_loss = unsupervise_loss.sum()  # 或 .mean()
 
+                self.scaler.scale(self.loss + unsupervise_loss).backward()  # 加上无监督损失
+                self.ema.update(self.model)
                 # 优化
                 if ni - last_opt_step >= self.accumulate:  # 检查是否达到优化条件
                     self.optimizer_step()  # 执行优化步
