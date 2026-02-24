@@ -132,6 +132,8 @@ class BaseModel(nn.Module):
         """
         y, dt, embeddings = [], [], []  # 输出
         for m in self.model:
+            # m.f 是来自前一层的索引（-1 表示直接来自前一层）
+            # 
             if m.f != -1:  # 如果不是来自前一层
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # 来自早期层
             if profile:
@@ -144,7 +146,7 @@ class BaseModel(nn.Module):
                 embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # 拉平
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
-        return x
+        return x # 返回最终结果
 
     def _predict_augment(self, x):
         """对输入图像 x 执行增强并返回增强的推理。"""
@@ -409,6 +411,7 @@ class DetectionModel(BaseModel):
         return y
 
     def init_criterion(self):
+        #定义损失函数的环节
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 

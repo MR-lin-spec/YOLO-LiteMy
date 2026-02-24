@@ -146,9 +146,9 @@ def check_det_dataset(dataset):
                 )
             LOGGER.info("警告 ⚠️ 将数据 YAML 中的 'validation' 键重命名为 'val' 以匹配 YOLO 格式。")
             data["val"] = data.pop("validation")  # 将 'validation' 键替换为 'val' 键
-    if "names" not in data:  # 检查名称
+    if "names" not in data and not data.get("is_unlabel", False):  # 检查名称,如果为无标签数据集则跳过
         data["names"] = [f"class_{i}" for i in range(data["nc"])]  # 如果没有，生成默认名称
-    else:
+    elif not data.get("is_unlabel", False):
         data["nc"] = len(data["names"])  # 更新类别数量
 
     # 解析路径

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch import nn, optim
 from yololite.data import build_dataloader, build_yolo_dataset
+from yololite.data.build import build_unlabeleddataloader, build_unlabelyolo_dataset
 from yololite.engine.validator import DetectionValidator
 from yololite.nn.tasks import DetectionModel
 from yololite.utils.plotting import plot_images, plot_labels, plot_results
@@ -131,7 +132,27 @@ class DetectionTrainer:
         else:
             self.lf = lambda x: max(1 - x / self.epochs, 0) * (1.0 - self.args.lrf) + self.args.lrf  # 线性调度
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)  # 学习率调度器
-
+#-----------------------------------------------------------------新增部分--------------------------------------#
+    def get_unlabeldataset(self):
+        """检查并获取无标签数据集。"""
+        if not hasattr(self.args, "unlabeldata") or not self.args.unlabeldata:
+            LOGGER.warning("未提供 unlabeldata 参数，跳过无标签数据集构建。")
+            return None
+        data = check_det_dataset(self.args.unlabeldata)
+        if "yaml_file" in data:
+            self.args.unlabeldata = data["yaml_file"]
+        self.unlabel_data = data
+        return data.get("train")  # 返回无标签训练集路径
+    def get_unlabeldataloader(self, dataset_path, batch_size=16):
+        """构建并返回无标签数据加载器。"""
+        if dataset_path is None:
+            return None
+        dataset = self.build_unlabeleddataset(dataset_path, mode="unlabel", batch=batch_size)
+        shuffle = True
+        workers = self.args.workers
+        return build_unlabeleddataloader(dataset, batch_size, workers, shuffle)
+    
+    
     def _setup_train(self):
         """构建数据加载器和优化器。"""
         # 模型设置
@@ -176,12 +197,20 @@ class DetectionTrainer:
         # 数据加载器
         batch_size = self.batch_size
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, mode="train")
-
+        # 【关键新增】创建无标签数据加载器
+        unlabel_path = self.get_unlabeldataset()
+        if unlabel_path:
+            self.unlabelloader = self.get_unlabeldataloader(unlabel_path, batch_size=batch_size)
+            LOGGER.info(f"成功创建无标签数据加载器，路径: {unlabel_path}")
+        else:
+            self.unlabelloader = None
+            LOGGER.info("未配置或未找到无标签数据，将以纯监督模式训练。")
         # 测试数据加载器
         self.test_loader = self.get_dataloader(self.testset, batch_size=batch_size * 2, mode="val")
         self.validator = self.get_validator()  # 获取验证器
         metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")  # 指标键
         self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))  # 初始化指标
+
         self.ema = ModelEMA(self.model)  # 初始化 EMA
         if self.args.plots:
             self.plot_training_labels()  # 绘制训练标签
@@ -203,7 +232,7 @@ class DetectionTrainer:
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False  # 提前停止
         self.resume_training(ckpt)  # 恢复训练
         self.scheduler.last_epoch = self.start_epoch - 1  # 不移动
-
+    
     def train(self):
         self._setup_train()  # 设置训练
         nb = len(self.train_loader)  # 批次数
@@ -237,6 +266,7 @@ class DetectionTrainer:
 
             LOGGER.info(self.progress_string())  # 打印进度信息
             pbar = TQDM(enumerate(self.train_loader), total=nb)  # 进度条显示
+            unlabel_iter = iter(self.unlabelloader) if self.unlabelloader else None
             self.tloss = None  # 总损失初始化
             for i, batch in pbar:
                 # 热身
@@ -251,15 +281,36 @@ class DetectionTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
+                # 获取无标签批次
+                unlabelbatch = None
+                if unlabel_iter is not None:
+                    try:
+                        unlabelbatch = next(unlabel_iter)
+                    except StopIteration:
+                        unlabel_iter = iter(self.unlabelloader)  # 重置迭代器
+                        unlabelbatch = next(unlabel_iter)
+                    unlabelbatch = self.preprocess_batch(unlabelbatch)  # 归一化等操作
 
                 # 前向传播
                 with autocast(self.amp):  # 自动混合精度
+                    if unlabelbatch is not None:  # 混合训练
+                        preds_teacher= self.ema.ema.predict(unlabelbatch['img']) # 预测
+                        print("无标签测试成功")
+                    else:  # 单标签训练
+                        preds = self.model(batch)
                     batch = self.preprocess_batch(batch)  # 预处理批次
                     self.loss, self.loss_items = self.model(batch)  # 计算损失
+                    print("模型输出：", self.model(batch))
+                    test_student_pred=self.model.forward(batch["img"]) # 模型前向传播得到学生模型的预测结果
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
-
+                    test_ema=self.ema.ema.predict(batch['img'])
+                    print("模型测试输出：", test_ema)
+                    test_result_loss=self.model.criterion(test_ema,batch) #也可以模仿相关写法，重新编写无监督损失
+                    print("模型测试损失：", test_result_loss)
+                    update_ema=self.ema.update(self.model)# 由于ema的update方法是没有返回值的，所以是None
+                    print("ema测试输出：", test_ema)
                 # 反向传播
                 if not self.loss.dim() == 0:  # 检查是否为标量
                     self.loss = self.loss.sum()  # 或 .mean()
@@ -388,7 +439,7 @@ class DetectionTrainer:
             self.best.write_bytes(serialized_ckpt)  # 保存 best.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # 保存当前 epoch
-
+    #通过数据文件获取数据集路径
     def get_dataset(self):
         """检查并获取数据集。"""
         data = check_det_dataset(self.args.data)  # 检查数据集
@@ -472,11 +523,19 @@ class DetectionTrainer:
         workers = self.args.workers if mode == "train" else self.args.workers * 2  # 设置工作线程数
         return build_dataloader(dataset, batch_size, workers, shuffle)  # 返回数据加载器
 
+
     def build_dataset(self, img_path, mode="train", batch=None):
         """构建并返回 YOLO 数据集。"""
         gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)  # 网格大小
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)  # 返回数据集
 
+
+
+    def build_unlabeleddataset(self, img_path, mode="train", batch=None):
+        """构建并返回 YOLO 数据集。"""
+        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)  # 网格大小
+        return build_unlabelyolo_dataset(self.args, img_path, batch, self.data, rect=mode == "val", stride=gs)  # 返回数据集
+    
     def set_model_attributes(self):
         """设置模型属性，如类别数量和名称。"""
         self.model.nc = self.data["nc"]  # 附加类别数量到模型

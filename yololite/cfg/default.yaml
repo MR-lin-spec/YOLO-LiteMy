@@ -6,6 +6,7 @@ mode: train  # (str) YOLO 模式，例如 train（训练）、val（验证）、
 # 训练设置 -------------------------------------------------------------------------------------------------------
 model:  # (str, optional) 模型文件路径，例如 yolov8n.pt、yolov8n.yaml
 data:  # (str, optional) 数据文件路径，例如 coco8.yaml
+unlabeldata:  # (str, optional) 无标签数据文件路径，例如 coco8_unlabel.yaml
 epochs: 100  # (int) 训练的总周期数
 time:  # (float, optional) 训练时间（小时），如果提供则覆盖 epochs
 patience: 100  # (int) 在没有可观察改进时，提前停止训练的等待周期数

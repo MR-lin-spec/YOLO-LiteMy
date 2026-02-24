@@ -30,7 +30,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from yololite.data.utils import FORMATS_HELP_MSG, HELP_URL, IMG_FORMATS
 from yololite.utils import DEFAULT_CFG, LOGGER, NUM_THREADS, TQDM
-
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 class YOLODataset(Dataset):
     """
@@ -340,3 +340,260 @@ class YOLODataset(Dataset):
             new_batch["batch_idx"][i] += i  # 为 build_targets() 添加目标图像索引
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)  # 合并索引
         return new_batch  # 返回合并后的批次
+
+
+
+
+class YOLOUnlabeledDataset(Dataset):
+    """
+    无标签数据集类 - 用于无监督/自监督训练。
+    
+    核心特点：
+        ✅ 无需标签文件
+        ✅ 兼容原 YOLODataset 接口
+        ✅ 支持训练级数据增强
+        ✅ 输出格式兼容训练流程
+    
+    参数：
+        img_path (str | list): 图像文件夹路径或文件列表
+        imgsz (int): 图像大小，默认 640
+        augment (bool): 是否使用数据增强，默认 True
+        hyp (dict): 数据增强超参数，默认 DEFAULT_CFG
+        batch_size (int): 批量大小，默认 16
+        stride (int): 步幅，默认 32
+        rect (bool): 是否矩形训练，默认 False
+        cache (bool): 是否缓存图像，默认 False
+    """
+
+    def __init__(
+            self,
+            img_path: Union[str, List[str], Path],
+            imgsz: int = 640,
+            augment: bool = True,
+            hyp: Optional[dict] = None,
+            batch_size: int = 16,
+            stride: int = 32,
+            rect: bool = False,
+            pad: float = 0.5,
+            cache: bool = False,
+            prefix: str = "[Unlabeled] ",
+    ):
+        super().__init__()
+        
+        # 基础配置
+        self.img_path = img_path
+        self.imgsz = imgsz
+        self.augment = augment
+        self.hyp = hyp if hyp else DEFAULT_CFG
+        self.prefix = prefix
+        self.batch_size = batch_size
+        self.stride = stride
+        self.rect = rect
+        self.pad = pad
+        self.cache = cache
+        
+        # 获取图像文件
+        self.im_files = self._get_img_files(img_path)
+        self.ni = len(self.im_files)
+        assert self.ni > 0, f"{prefix}未找到任何图像文件"
+        
+        # 创建空标签结构（每条数据一个）
+        self.labels = self._create_empty_labels()
+        
+        # 矩形训练配置
+        if self.rect:
+            assert self.batch_size is not None
+            self._set_rectangle()
+        
+        # 图像缓存
+        self.buffer = []
+        self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
+        self.ims = [None] * self.ni
+        self.im_hw0 = [None] * self.ni
+        self.im_hw = [None] * self.ni
+        
+        # 构建数据增强
+        self.transforms = self._build_transforms()
+        
+        LOGGER.info(f"{prefix}数据集初始化完成: {self.ni} 张图像, 增强={self.augment}")
+
+    def _get_img_files(self, img_path):
+        """获取图像文件列表。"""
+        f = []
+        for p in img_path if isinstance(img_path, list) else [img_path]:
+            p = Path(p)
+            if p.is_dir():
+                f += glob.glob(str(p / "**" / "*.*"), recursive=True)
+            elif p.is_file():
+                with open(p) as t:
+                    t = t.read().strip().splitlines()
+                    parent = str(p.parent) + os.sep
+                    f += [x.replace("./", parent) if x.startswith("./") else x for x in t]
+            else:
+                raise FileNotFoundError(f"{self.prefix}{p} 不存在")
+        
+        im_files = sorted(x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS)
+        return im_files
+
+    def _create_empty_labels(self):
+        """为每张图像创建空标签结构。"""
+        labels = []
+        for im_file in self.im_files:
+            # 获取图像形状
+            im = cv2.imread(im_file)
+            shape = im.shape[:2] if im is not None else (self.imgsz, self.imgsz)
+            
+            labels.append({
+                "im_file": im_file,
+                "shape": shape,
+                "cls": np.empty((0, 1)),      # 空类别
+                "bboxes": np.empty((0, 4)),   # 空边界框
+                "normalized": True,
+                "bbox_format": "xywh",
+            })
+        return labels
+
+    def _build_transforms(self):
+        """构建数据增强转换。"""
+        if self.augment:
+            self.hyp.mosaic = self.hyp.mosaic if not self.rect else 0.0
+            self.hyp.mixup = self.hyp.mixup if not self.rect else 0.0
+            transforms = v8_transforms(self, self.imgsz, self.hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                batch_idx=True,
+                bgr=self.hyp.bgr if self.augment else 0.0,
+            )
+        )
+        
+        return transforms
+
+    def _set_rectangle(self):
+        """设置矩形训练参数。"""
+        bi = np.floor(np.arange(self.ni) / self.batch_size).astype(int)
+        nb = bi[-1] + 1
+        
+        s = np.array([x["shape"] for x in self.labels])
+        ar = s[:, 0] / s[:, 1]
+        irect = ar.argsort()
+        
+        self.im_files = [self.im_files[i] for i in irect]
+        self.labels = [self.labels[i] for i in irect]
+        
+        shapes = [[1, 1]] * nb
+        for i in range(nb):
+            ari = ar[bi == i]
+            mini, maxi = ari.min(), ari.max()
+            if maxi < 1:
+                shapes[i] = [maxi, 1]
+            elif mini > 1:
+                shapes[i] = [1, 1 / mini]
+        
+        self.batch_shapes = np.ceil(np.array(shapes) * self.imgsz / self.stride + self.pad).astype(int) * self.stride
+        self.batch = bi
+
+    def load_image(self, i, rect_mode=True):
+        """加载图像。"""
+        im = self.ims[i]
+        
+        if im is None:
+            im = cv2.imread(self.im_files[i])
+            if im is None:
+                raise IOError(f"无法读取图像: {self.im_files[i]}")
+            
+            h0, w0 = im.shape[:2]
+            
+            if rect_mode and self.rect:
+                r = self.imgsz / max(h0, w0)
+                if r != 1:
+                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+            elif not (h0 == w0 == self.imgsz):
+                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+            
+            if self.augment:
+                self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]
+                self.buffer.append(i)
+                if len(self.buffer) > self.max_buffer_length:
+                    j = self.buffer.pop(0)
+                    self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+            
+            return im, (h0, w0), im.shape[:2]
+        
+        return self.ims[i], self.im_hw0[i], self.im_hw[i]
+
+    def get_image_and_label(self, index):
+        """获取图像和标签。"""
+        label = deepcopy(self.labels[index])
+        im, ori_shape, resized_shape = self.load_image(index)
+        
+        label["img"] = im
+        label["ori_shape"] = ori_shape
+        label["resized_shape"] = resized_shape
+        label["ratio_pad"] = (
+            resized_shape[0] / ori_shape[0],
+            resized_shape[1] / ori_shape[1],
+        )
+        
+        if self.rect:
+            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+        
+        return self._update_labels_info(label)
+
+    def _update_labels_info(self, label):
+        """更新标签格式。"""
+        bboxes = label.pop("bboxes", np.empty((0, 4)))
+        bbox_format = label.pop("bbox_format", "xywh")
+        normalized = label.pop("normalized", True)
+        
+        label["instances"] = Instances(bboxes, bbox_format=bbox_format, normalized=normalized)
+        
+        if "cls" not in label:
+            label["cls"] = np.empty((0, 1))
+        
+        return label
+
+    def __getitem__(self, index):
+        """获取单个样本。"""
+        return self.transforms(self.get_image_and_label(index))
+
+    def __len__(self):
+        """返回数据集大小。"""
+        return len(self.labels)
+
+    def close_mosaic(self, hyp):
+        """训练后期关闭马赛克增强。"""
+        hyp.mosaic = 0.0
+        hyp.mixup = 0.0
+        self.transforms = self._build_transforms()
+
+    @staticmethod
+    def collate_fn(batch):
+        """批次合并。"""
+        new_batch = {}
+        keys = batch[0].keys()
+        values = list(zip(*[list(b.values()) for b in batch]))
+        
+        for i, k in enumerate(keys):
+            value = values[i]
+            
+            if k == "img":
+                value = torch.stack(value, 0)
+            elif k == "instances":
+                value = Instances.cat(value)
+            elif k == "batch_idx":
+                value = list(value)
+                for j in range(len(value)):
+                    value[j] += j
+                value = torch.cat(value, 0)
+            elif k in {"im_file", "ori_shape", "resized_shape", "ratio_pad"}:
+                value = list(value)
+            
+            new_batch[k] = value
+        
+        return new_batch

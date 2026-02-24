@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import dataloader
 
-from yololite.data.dataset import YOLODataset
+from yololite.data.dataset import YOLODataset, YOLOUnlabeledDataset
 from yololite.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -78,7 +78,7 @@ def seed_worker(worker_id):  # noqa
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-
+#有标签dataset构建
 def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32):
     return YOLODataset(
         img_path=img_path,
@@ -94,8 +94,23 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
         classes=cfg.classes,
         data=data,
     )
+# 无标签数据集构建
+def build_unlabelyolo_dataset(cfg, unlabelimg_path, unlabelbatchsize=32,  mode="train", rect=False, stride=32):
+    return YOLOUnlabeledDataset(
+        img_path=unlabelimg_path,
+        imgsz=cfg.imgsz,
+        batch_size=unlabelbatchsize,
+        augment=mode == "train",  # augmentation
+        hyp=cfg,
+        rect=cfg.rect or rect,  # rectangular batches
+        stride=int(stride),
+        pad=0.0 if mode == "train" else 0.5,
+        prefix=colorstr(f"{mode}: "),
+        
+    )
 
 
+#有标签dataloader构建
 def build_dataloader(dataset, batch, workers, shuffle=True):
     """Return an InfiniteDataLoader or DataLoader for training or validation set."""
     batch = min(batch, len(dataset))
@@ -115,6 +130,25 @@ def build_dataloader(dataset, batch, workers, shuffle=True):
         generator=generator,
     )
 
+#无标签dataloader构建
+def build_unlabeleddataloader(unlabeldataset, batch, workers, shuffle=True):
+    """Return an InfiniteDataLoader or DataLoader for training or validation set."""
+    batch = min(batch, len(unlabeldataset))
+    nd = torch.cuda.device_count()  # number of CUDA devices
+    nw = min(os.cpu_count() // max(nd, 1), workers)  # number of workers
+    generator = torch.Generator()
+    generator.manual_seed(6148914691236517205)
+    return InfiniteDataLoader(
+        dataset=unlabeldataset,
+        batch_size=batch,
+        shuffle=shuffle,
+        num_workers=nw,
+        sampler=None,
+        pin_memory=PIN_MEMORY,
+        collate_fn=getattr(unlabeldataset, "collate_fn", None),
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
 
 def check_source(source):
     """Check source type and return corresponding flag values."""

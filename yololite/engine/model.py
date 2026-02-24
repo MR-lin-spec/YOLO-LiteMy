@@ -128,6 +128,11 @@ class YOLOLite(nn.Module):
             "model": self.overrides["model"],
             "task": self.task,
         }
+        # 【新增】将 unlabeldata 参数注入 custom 字典
+        if "unlabeldata" in kwargs:
+            custom["unlabeldata"] = kwargs["unlabeldata"]
+        if "isunlabel" in kwargs:
+            custom["isunlabel"]=kwargs["isunlabel"]
         args = {**overrides, **custom, **kwargs, "mode": "train"}  # 合并参数
         if args.get("resume"):
             args["resume"] = self.ckpt_path  # 设置恢复路径
