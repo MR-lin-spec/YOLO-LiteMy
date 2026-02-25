@@ -20,9 +20,9 @@ if __name__ == '__main__':
 
 #无标签训练
   results = model.train(
-          data="voc.yaml",               # 有标签数据集配置文件路径
-          unlabeldata="my_dataset.yaml", # 无标签数据集配置文件路径
-          epochs=1,                      # 训练周期数
+          data="data_labeled.yaml",               # 有标签数据集配置文件路径
+          unlabeldata="data_unlabel.yaml", # 无标签数据集配置文件路径
+          epochs=2,                      # 训练周期数
           imgsz=640,                     # 输入图像尺寸
           batch=16,                      # 批次大小
           device="cuda"                  # 指定训练设备

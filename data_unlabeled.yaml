@@ -1,4 +1,0 @@
-path: D:\Dataset\data\data
-is_unlabel: True
-val:
-train: images\train  # train images (relative to 'path')

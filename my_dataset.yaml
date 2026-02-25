@@ -1,4 +1,0 @@
-path: D:\YOLO_Project\VOCtrainval\VOCdevkit\YOLO2012
-train: unlabel_image\images
-val: 
-is_unlabel: True

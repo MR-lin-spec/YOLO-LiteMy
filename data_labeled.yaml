@@ -1,0 +1,25 @@
+path: /root/autodl-tmp/YOLO2012
+train: labeled_data/images
+val: val/images
+nc: 20
+names:
+  0: aeroplane
+  1: bicycle
+  2: boat
+  3: bus
+  4: car
+  5: motorbike
+  6: train
+  7: bottle
+  8: chair
+  9: diningtable
+  10: pottedplant
+  11: sofa
+  12: tvmonitor
+  13: bird
+  14: cat
+  15: cow
+  16: dog
+  17: horse
+  18: sheep
+  19: person
