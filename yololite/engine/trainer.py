@@ -152,7 +152,40 @@ class DetectionTrainer:
         workers = self.args.workers
         return build_unlabeleddataloader(dataset, batch_size, workers, shuffle)
     
-    
+    def get_dynamic_weights(self, epoch):
+        """
+        根据当前epoch计算动态权重
+        
+        参数:
+            epoch (int): 当前epoch数
+        
+        返回:
+            tuple: (supervised_weight, unsupervised_weight)
+        """
+        # 确保epoch在有效范围内
+        epoch = max(0, min(epoch, self.epochs))
+        
+        # 计算过渡进度 (0到1之间)
+        if self.weight_transition_end_epoch == self.weight_transition_start_epoch:
+            progress = 1.0
+        else:
+            progress = (epoch - self.weight_transition_start_epoch) / \
+                    (self.weight_transition_end_epoch - self.weight_transition_start_epoch)
+            progress = max(0.0, min(1.0, progress))  # 限制在[0, 1]范围
+        
+        # 使用余弦退火策略平滑过渡（也可以使用线性策略）
+        # 余弦策略：更平滑，避免突变
+        cosine_progress = (1 - math.cos(progress * math.pi)) / 2
+        
+        # 计算监督损失权重（从1降到0）
+        supervised_weight = self.supervised_weight_start + \
+                        (self.supervised_weight_end - self.supervised_weight_start) * cosine_progress
+        
+        # 计算无监督损失权重（从0升到1）
+        unsupervised_weight = self.unsupervised_weight_start + \
+                            (self.unsupervised_weight_end - self.unsupervised_weight_start) * cosine_progress
+        
+        return supervised_weight, unsupervised_weight
     def _setup_train(self):
         """构建数据加载器和优化器。"""
         # 模型设置
@@ -227,13 +260,24 @@ class DetectionTrainer:
             decay=weight_decay,
             iterations=iterations,
         )
+        #权重设置
+        # 在 _setup_train() 方法中添加（在 consistent_loss 初始化之后）
+        self.supervised_weight_start = 1.0  # 初始监督损失权重
+        self.supervised_weight_end = 0.0    # 最终监督损失权重
+        self.unsupervised_weight_start = 0.0  # 初始无监督损失权重
+        self.unsupervised_weight_end = 1.0    # 最终无监督损失权重
+        # 权重过渡策略参数
+        self.weight_transition_start_epoch = 2  # 开始过渡的epoch
+        self.weight_transition_end_epoch = self.epochs-1  # 结束过渡的epoch
+        num_classes = self.data.get("nc", 80) 
         self.consistent_loss = YOLO26ConsistencyLoss(
-        box_weight=1.0,
-        cls_weight=1.0,
-        obj_weight=0.5,
-        temperature=1.0,
-        confidence_threshold=0.25,
-        iou_type="ciou",
+            box_weight=1.0,
+            cls_weight=1.0,
+            # obj_weight 已移除，不再需要
+            temperature=1.0,
+            confidence_threshold=0.25,
+            num_classes=num_classes,  # <--- 新增：必须传入类别数
+            topk=13                   # <--- 新增：动态分配器的 TopK 参数
         )
         # 设置学习率调度器
         self._setup_scheduler()
@@ -301,20 +345,20 @@ class DetectionTrainer:
 
                 # 前向传播
                 with autocast(self.amp):  # 自动混合精度
+                    sup_weight, unsup_weight = self.get_dynamic_weights(epoch) #计算权重
                     #学生模型和教师模型预测
                     if unlabelbatch is not None:  # 混合训练
                         teacher_preds= self.ema.ema.predict(unlabelbatch['img']) # 预测
-                   
                     batch = self.preprocess_batch(batch)  # 预处理批次
                     #计算无监督损失
                     student_preds=self.model.forward(batch["img"]) # 模型前向传播得到学生模型的预测结果
+                    #print("学生模型预测形状：", type(student_preds))
+                    #print("教师模型预测形状：", type(teacher_preds))
                     unsupervise_loss, unsupervise_loss_dict = self.consistent_loss(student_preds, teacher_preds)
+                    unsupervise_loss=unsupervise_loss * 0.1 # 无监督损失缩放
                     #print("无监督损失：", unsupervise_loss)
                     #如果小于制定轮数，采用有监督，否则采用无监督
-                    if epoch<20:
-                        self.loss, self.loss_items = self.model(batch)  # 计算损失
-                    else:
-                        self.loss, self.loss_items=unsupervise_loss, unsupervise_loss_dict
+                    self.loss, self.loss_items = self.model(batch)  # 计算损失
                     #print("模型输出：", self.model(batch))
                    
                     self.tloss = (
@@ -327,10 +371,16 @@ class DetectionTrainer:
                 if not self.loss.dim() == 0:  # 检查是否为标量
                     self.loss = self.loss.sum()  # 或 .mean()
                
-                if not unsupervise_loss.dim() == 0:  # 检查是否为标量
-                    unsupervise_loss = unsupervise_loss.sum()  # 或 .mean()
+                total_unsup_loss = 0.0
+                if isinstance(unsupervise_loss, torch.Tensor):
+                    if unsupervise_loss.numel() > 0:
+                        total_unsup_loss = unsupervise_loss.sum() # 确保是标量
+                    else:
+                        total_unsup_loss = torch.tensor(0.0, device=self.device)
+                else:
+                    total_unsup_loss = torch.tensor(unsupervise_loss, device=self.device)
 
-                self.scaler.scale(self.loss + unsupervise_loss).backward()  # 加上无监督损失
+                self.scaler.scale(self.loss*sup_weight + total_unsup_loss*unsup_weight).backward()  # 加上无监督损失
                 self.ema.update(self.model)
                 # 优化
                 if ni - last_opt_step >= self.accumulate:  # 检查是否达到优化条件
@@ -345,14 +395,18 @@ class DetectionTrainer:
 
                 # 日志记录
                 loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+            # 在pbar.set_description之前添加动态权重信息
                 pbar.set_description(
-                    ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                    ("%11s" * 2 + "%11.4g" * (2 + loss_length) + " sup_w:%.3f unsup_w:%.3f unsup_loss:%.4g")
                     % (
                         f"{epoch + 1}/{self.epochs}",
-                        f"{self._get_memory():.3g}G",  # GPU 内存使用情况
-                        *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # 损失值
-                        batch["cls"].shape[0],  # 当前批量大小
-                        batch["img"].shape[-1],  # 图像大小
+                        f"{self._get_memory():.3g}G",
+                        *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
+                        batch["cls"].shape[0],
+                        batch["img"].shape[-1],
+                        sup_weight,
+                        unsup_weight,
+                        unsupervise_loss.item() if isinstance(unsupervise_loss, torch.Tensor) else unsupervise_loss,
                     )
                 )
                 if self.args.plots and ni in self.plot_idx:

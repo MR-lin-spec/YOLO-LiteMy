@@ -9,7 +9,7 @@ data:  # (str, optional) 数据文件路径，例如 coco8.yaml
 unlabeldata:  # (str, optional) 无标签数据文件路径，例如 coco8_unlabel.yaml
 epochs: 100  # (int) 训练的总周期数
 time:  # (float, optional) 训练时间（小时），如果提供则覆盖 epochs
-patience: 100  # (int) 在没有可观察改进时，提前停止训练的等待周期数
+patience: 120  # (int) 在没有可观察改进时，提前停止训练的等待周期数
 batch: 16  # (int) 每批次图像数量（-1 表示自动批量）
 imgsz: 640  # (int | list) 输入图像大小，训练和验证模式下为整数，预测和导出模式下为列表[h, w]
 save: True  # (bool) 是否保存训练检查点和预测结果
