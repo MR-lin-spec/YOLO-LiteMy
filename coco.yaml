@@ -1,9 +1,9 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 # COCO 2017 dataset
-path: /root/autodl-tmp/COCO/labels
-train: train2017.txt
-val: val2017.txt
+path: /root/autodl-tmp/coco
+train: images/train2017
+val: images/val2017
 test: 
 
 # Classes (保持不变)

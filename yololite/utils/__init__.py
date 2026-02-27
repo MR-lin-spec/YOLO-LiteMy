@@ -170,43 +170,72 @@ def plt_settings(rcparams=None, backend="Agg"):
     return decorator
 
 
-def set_logging(name="LOGGING_NAME", verbose=True):
-    level = logging.INFO if verbose else logging.ERROR  # rank in world for Multi-GPU trainings
+def set_logging(name="LOGGING_NAME", verbose=True, log_file=None):
+    """
+    配置日志记录器。
+    
+    参数:
+        name (str): logger的名称
+        verbose (bool): 是否输出INFO级别日志，否则只输出ERROR
+        log_file (str, optional): 日志文件保存路径 (例如: runs/train/exp/train.log)。
+                                  如果为None，则只输出到控制台。
+    """
+    level = logging.INFO if verbose else logging.ERROR
 
-    # Configure the console (stdout) encoding to UTF-8, with checks for compatibility
-    formatter = logging.Formatter("%(message)s")  # Default formatter
+    # 1. 配置 Formatter (与控制台保持一致)
+    formatter = logging.Formatter("%(message)s")
+    
+    # 处理 Windows 下 UTF-8 编码问题 (保留原逻辑)
     if WINDOWS and hasattr(sys.stdout, "encoding") and sys.stdout.encoding != "utf-8":
-
         class CustomFormatter(logging.Formatter):
             def format(self, record):
-                """Sets up logging with UTF-8 encoding and configurable verbosity."""
                 return emojis(super().format(record))
 
         try:
-            # Attempt to reconfigure stdout to use UTF-8 encoding if possible
             if hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(encoding="utf-8")
-            # For environments where reconfigure is not available, wrap stdout in a TextIOWrapper
             elif hasattr(sys.stdout, "buffer"):
                 import io
-
                 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
             else:
                 formatter = CustomFormatter("%(message)s")
         except Exception as e:
             print(f"Creating custom formatter for non UTF-8 environments due to {e}")
             formatter = CustomFormatter("%(message)s")
+            
+        # 如果使用了自定义Formatter，文件日志也应该使用它以支持emoji等特殊字符
+        file_formatter = formatter 
+    else:
+        file_formatter = formatter
 
-    # Create and configure the StreamHandler with the appropriate formatter and level
+    # 2. 创建 Logger
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    # 3. 配置控制台 Handler (StreamHandler) - 原有逻辑
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(level)
-
-    # Set up the logger
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
     logger.addHandler(stream_handler)
-    logger.propagate = False
+    log_file=log_file if log_file is not None else f"runs/{name}/train.log"  # 默认日志文件路径
+
+    # 4. 【新增】配置文件 Handler (FileHandler)
+    if log_file:
+        # 确保日志文件的目录存在
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        
+        # 创建文件处理器，encoding='utf-8' 保证中文和特殊字符不乱码
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(file_formatter)
+        file_handler.setLevel(level)
+        logger.addHandler(file_handler)
+        
+        # 可选：打印一条日志确认文件路径
+        # logger.info(f"Logging saved to {log_file}")
+
     return logger
 
 
