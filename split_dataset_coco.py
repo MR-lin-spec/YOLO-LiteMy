@@ -9,9 +9,9 @@ import argparse
 
 parser = argparse.ArgumentParser()
 #这里根据自己的json文件位置，换成自己的就行
-parser.add_argument('--json_path', default='/root/autodl-tmp/coco/annoation_2017/instances_val2017.json',type=str, help="input: coco format(json)")
+parser.add_argument('--json_path', default='/root/autodl-tmp/coco/annoation_2017/instances_train2017.json',type=str, help="input: coco format(json)")
 #这里设置.txt文件保存位置
-parser.add_argument('--save_path', default='/root/autodl-tmp/coco/labels/val2017', type=str, help="specify where to save the output dir of labels")
+parser.add_argument('--save_path', default='/root/autodl-tmp/coco/labels/train2017', type=str, help="specify where to save the output dir of labels")
 arg = parser.parse_args()
 
 def convert(size, box):
