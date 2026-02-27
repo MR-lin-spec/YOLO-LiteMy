@@ -162,10 +162,20 @@ def generate_yaml(output_dir, root_path, train_sub, val_sub, names, nc, yaml_nam
     if not is_unlabel:
         lines.append(f"nc: {nc}")
         lines.append("names:")
-        for k, v in sorted(names.items()):
-            lines.append(f"  {k}: {v}")
+        # --- 修改开始 ---
+        if isinstance(names, list):
+            # 如果 names 是列表，转换为字典格式输出，或者直接按列表逻辑处理
+            # 这里为了兼容原有逻辑，我们把它转成字典再遍历，或者直接写列表格式到 yaml
+            # 原脚本似乎倾向于输出字典格式的 yaml，所以我们这里做个转换
+            names_dict = {str(i): name for i, name in enumerate(names)}
+            for k, v in sorted(names_dict.items(), key=lambda x: int(x[0])):
+                lines.append(f"  {k}: {v}")
+        elif isinstance(names, dict):
+            # 原有的字典处理逻辑
+            for k, v in sorted(names.items()):
+                lines.append(f"  {k}: {v}")
     else:
-        lines.append("is_unlabel: True")
+        lines.append("is_unlabel: True")  # 如果 names 既不是列表也不是字典，标记为无标签数据集
         
     content = "\n".join(lines) + "\n"
     yaml_path = Path(output_dir) / yaml_name
@@ -192,26 +202,61 @@ def main():
     train_src_abs = cfg['train_abs']
     val_sub = cfg['val_sub']
     
+    # ... (前文代码：加载 config, 确定 root, train_src_abs 不变) ...
+
     print(f"📂 数据集根目录：{root}")
     
     if not train_src_abs or not train_src_abs.exists():
         print(f"❌ 错误：原始训练集图片目录不存在")
         return
 
-    # 确定标签目录
-    labels_src_abs = train_src_abs.parent / "labels"
-    if not labels_src_abs.exists():
-        labels_src_abs = root / "train" / "labels"
+    # === 修改开始：智能查找标签目录 ===
+    labels_src_abs = None
     
-    if not labels_src_abs.exists():
-        print(f"⚠️ 警告：未找到标签目录，按无标签模式处理。")
+    # 策略 1: 根据图片路径推断 (例如 images/train -> labels/train)
+    # 假设结构是 root/images/train 和 root/labels/train
+    if "images" in str(train_src_abs):
+        # 将路径中的 'images' 替换为 'labels'
+        potential_labels = Path(str(train_src_abs).replace("/images", "/labels"))
+        if potential_labels.exists():
+            labels_src_abs = potential_labels
+            print(f"🔍 自动推断标签目录 (images->labels): {labels_src_abs}")
+
+    # 策略 2: 如果策略1失败，尝试 root/labels/train (常见结构)
+    if not labels_src_abs:
+        candidate = root / "labels" / "train"
+        if candidate.exists():
+            labels_src_abs = candidate
+            print(f"🔍 找到标准标签目录: {labels_src_abs}")
+
+    # 策略 3: 尝试 root/train/labels (旧式结构)
+    if not labels_src_abs:
+        candidate = root / "train" / "labels"
+        if candidate.exists():
+            labels_src_abs = candidate
+            print(f"🔍 找到旧式标签目录: {labels_src_abs}")
+
+    # 策略 4: 尝试 root/labels (扁平结构)
+    if not labels_src_abs:
+        candidate = root / "labels"
+        if candidate.exists():
+            # 检查里面是否有 txt 文件，如果没有，可能还是不对
+            if list(candidate.glob("*.txt")):
+                labels_src_abs = candidate
+                print(f"🔍 找到扁平标签目录: {labels_src_abs}")
+
+    # === 修改结束 ===
+    
+    if not labels_src_abs:
+        print(f"⚠️ 警告：未找到标签目录 (尝试了多种路径)，按无标签模式处理。")
         img_classes = {}
-        all_imgs = [f.stem for f in train_src_abs.glob("*.*") if f.suffix.lower() in ['.jpg','.jpeg','.png','.bmp']]
+        all_imgs = [f.stem for f in train_src_abs.glob("*.*") if f.suffix.lower() in ['.jpg','.jpeg','.png','.bmp','.webp']]
         for img in all_imgs: img_classes[img] = [-1]
     else:
         print(f"🔍 分析标签中...")
         img_classes = get_image_classes(labels_src_abs)
 
+    # ... (后文代码不变) ...
     if not img_classes:
         print("❌ 错误：未找到任何图片。")
         return

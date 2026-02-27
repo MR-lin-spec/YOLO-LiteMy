@@ -22,7 +22,7 @@ if __name__ == '__main__':
   results = model.train(
           data="data_labeled.yaml",               # 有标签数据集配置文件路径
           unlabeldata="data_unlabel.yaml", # 无标签数据集配置文件路径
-          epochs=15,                      # 训练周期数
+          epochs=150,                      # 训练周期数
           imgsz=640,                     # 输入图像尺寸
           batch=16,                      # 批次大小
           device="cuda"                  # 指定训练设备
