@@ -81,7 +81,7 @@ class DynamicSoftLabelAssigner(nn.Module):
             dist = ((p_center[:, None] - g_center[None, :]) ** 2).sum(dim=-1).sqrt()
             dis_cost = (dist / (dist.max() + 1e-9)) * 10.0
 
-            cost_matrix = cls_cost + ious * self.iou_factor + dis_cost
+            cost_matrix = cls_cost-(ious * self.iou_factor) + dis_cost
 
             matching_matrix = torch.zeros_like(cost_matrix)
             candidate_topk = min(self.topk, n_boxes)
@@ -241,8 +241,8 @@ class YOLO26ConsistencyLoss(nn.Module):
         cls_weight: float = 1.0, 
         temperature: float = 1.0, 
         # 动态阈值参数：早期高阈值减少噪声，后期降低增加召回
-        confidence_threshold_start: float = 0.5,    # 初始高阈值
-        confidence_threshold_end: float = 0.25,      # 最终低阈值
+        confidence_threshold_start: float = 0.7,    # 初始高阈值
+        confidence_threshold_end: float = 0.55,      # 最终低阈值
         threshold_warmup_epochs: int = 50,           # 阈值过渡周期
         total_epochs: int = 175,                     # 总训练轮数
         num_classes: int = 80, 

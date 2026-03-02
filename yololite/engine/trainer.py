@@ -44,6 +44,7 @@ from yololite.utils.torch_utils import (
     unwrap_model
 )
 from yololite.utils.unsupervised_loss import YOLO26ConsistencyLoss,IOUloss
+MIN_EPOCH_FOR_UNSUP_FORWARD = 10
 class DetectionTrainer:
     """
     属性：
@@ -157,39 +158,70 @@ class DetectionTrainer:
     
     def get_dynamic_weights(self, epoch):
         """
-        根据当前epoch计算动态权重
+        计算动态权重，满足以下严格约束：
+        1. 有监督权重 + 无监督权重 = 1.0
+        2. 有监督权重 > 无监督权重 (即 unsup_weight 永远 < 0.5)
+        3. 在指定 epoch (weight_transition_end_epoch) 收敛到固定最大值，之后保持不变
         
         参数:
-            epoch (int): 当前epoch数
+            epoch (int): 当前 epoch 数
         
         返回:
             tuple: (supervised_weight, unsupervised_weight)
         """
-        # 确保epoch在有效范围内
-        epoch = max(0, min(epoch, self.epochs))
+        import math
+
+        # --- 配置区域 ---
+        # 无监督权重的最大上限 (必须 < 0.5 以满足条件2)
+        # 设置为 0.45 意味着：有监督最小为 0.55，无监督最大为 0.45
+        MAX_UNSUP_RATIO = 0.45 
         
-        # 计算过渡进度 (0到1之间)
-        if self.weight_transition_end_epoch == self.weight_transition_start_epoch:
+        # 确保 epoch 在有效范围内
+        current_epoch = max(0, min(epoch, self.epochs))
+        
+        # 定义过渡区间
+        start_ep = self.weight_transition_start_epoch
+        end_ep = self.weight_transition_end_epoch
+        
+        # 如果还没到开始时间，无监督权重为 0 (纯监督)
+        if current_epoch < start_ep:
+            return 1.0, 0.0
+        
+        # 如果已经结束过渡期，直接返回收敛后的固定值
+        if current_epoch >= end_ep:
+            unsup_weight = MAX_UNSUP_RATIO
+            sup_weight = 1.0 - unsup_weight
+            return sup_weight, unsup_weight
+        
+        # --- 计算过渡期内的动态权重 (余弦退火) ---
+        # 计算当前进度 (0.0 到 1.0)
+        if end_ep == start_ep:
             progress = 1.0
         else:
-            progress = (epoch - self.weight_transition_start_epoch) / \
-                    (self.weight_transition_end_epoch - self.weight_transition_start_epoch)
-            progress = max(0.0, min(1.0, progress))  # 限制在[0, 1]范围
+            progress = (current_epoch - start_ep) / (end_ep - start_ep)
+            # 严格限制在 [0, 1] 之间，防止浮点数误差
+            progress = max(0.0, min(1.0, progress))
         
-        # 使用余弦退火策略平滑过渡（也可以使用线性策略）
-        # 余弦策略：更平滑，避免突变
-        cosine_progress = (1 - math.cos(progress * math.pi)) / 2
+        # 余弦曲线映射：0 -> 0, 1 -> 1, 中间平滑
+        # 公式：(1 - cos(progress * pi)) / 2
+        cosine_factor = (1 - math.cos(progress * math.pi)) / 2
         
-        # 计算监督损失权重（从1降到0）
-        supervised_weight = self.supervised_weight_start + \
-                        (self.supervised_weight_end - self.supervised_weight_start) * cosine_progress
+        # 计算当前的无监督权重 (从 0 线性/曲线增长到 MAX_UNSUP_RATIO)
+        unsup_weight = self.unsupervised_weight_start + \
+                       (MAX_UNSUP_RATIO - self.unsupervised_weight_start) * cosine_factor
         
-        # 计算无监督损失权重（从0升到1）
-        unsupervised_weight = self.unsupervised_weight_start + \
-                            (self.unsupervised_weight_end - self.unsupervised_weight_start) * cosine_progress
+        # 再次确保不超标 (防御性编程)
+        unsup_weight = min(unsup_weight, MAX_UNSUP_RATIO)
+        unsup_weight = max(unsup_weight, 0.0)
         
-        return supervised_weight, unsupervised_weight
-    
+        # 计算有监督权重 (满足条件1: 和为1)
+        sup_weight = 1.0 - unsup_weight
+        
+        # 双重检查满足条件2: sup > unsup
+        # 理论上因为 MAX_UNSUP_RATIO < 0.5，这里永远成立，但加上断言以防配置错误
+        assert sup_weight > unsup_weight, f"权重配置错误：sup({sup_weight:.4f}) 必须大于 unsup({unsup_weight:.4f})"
+        
+        return sup_weight, unsup_weight
     
     
     
@@ -210,6 +242,8 @@ class DetectionTrainer:
             if isinstance(self.args.freeze, int)
             else []
         )
+        self.best_map50 = 0.0  # 初始化最佳 mAP50
+        self.current_map50 = 0.0  # 初始化当前 mAP50
         always_freeze_names = [".dfl"]  # 始终冻结的层
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         for k, v in self.model.named_parameters():
@@ -276,8 +310,8 @@ class DetectionTrainer:
         self.unsupervised_weight_start = 0.0  # 初始无监督损失权重
         self.unsupervised_weight_end = 1.0    # 最终无监督损失权重
         # 权重过渡策略参数
-        self.weight_transition_start_epoch = 2  # 开始过渡的epoch
-        self.weight_transition_end_epoch = self.epochs-1  # 结束过渡的epoch
+        self.weight_transition_start_epoch = max(10, int(self.epochs * 0.2)) 
+        self.weight_transition_end_epoch = self.epochs-5 # 结束过渡的epoch
         num_classes = self.data.get("nc", 80) 
         self.consistent_loss = YOLO26ConsistencyLoss(
             box_weight=1.0,
@@ -446,6 +480,22 @@ class DetectionTrainer:
             # 验证
             if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                 self.metrics, self.fitness = self.validate()  # 验证模型
+                # 提取 mAP50(B)
+            # 注意：根据你的日志头 "metrics/mAP50(B)"，key 可能是 'metrics/mAP50' 或直接是 'mAP50'
+            # 请根据你实际 metrics 字典的 key 进行调整
+            current_mAP50 = self.metrics.get('metrics/mAP50(B)', self.metrics.get('mAP50', 0.0))
+            
+            # 更新实例变量，供 get_dynamic_weights 使用
+            self.current_map50 = current_mAP50
+            
+            # 初始化 best_map50 (如果是第一个 epoch)
+            if not hasattr(self, 'best_map50'):
+                self.best_map50 = 0.0
+                self.unsup_freeze_triggered = False
+                
+            # 打印调试信息
+            if hasattr(self, 'unsup_freeze_triggered') and self.unsup_freeze_triggered:
+                LOGGER.info(f"🔒 无监督权重已冻结，当前 mAP: {current_mAP50:.4f}")
             self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})  # 保存指标
             self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch  # 检查是否停止训练
             if self.args.time:
@@ -911,7 +961,11 @@ class DetectionTrainer:
             sup_weight, unsup_weight = self.get_dynamic_weights(epoch)
             
             # 严格判断是否需要计算无监督分支 (避免无效计算)
-            compute_unsupervised = (unsup_weight > 1e-6) and has_unlabel
+            compute_unsupervised = (
+                (unsup_weight > 1e-6) and 
+                has_unlabel and 
+                (epoch >= MIN_EPOCH_FOR_UNSUP_FORWARD)  # <--- 新增这一行
+            )
             
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # 忽略警告
@@ -977,6 +1031,7 @@ class DetectionTrainer:
                     unsupervise_loss_val = 0.0 # 用于日志显示的数值
                     
                     if compute_unsupervised and unlabelbatch is not None:
+                        LOGGER.info(f"启用无监督分支")
                         # 教师模型预测 (No Grad)
                         with torch.no_grad():
                             teacher_preds = self.ema.ema.predict(unlabelbatch['img'])
@@ -1152,7 +1207,7 @@ class DetectionTrainer:
                 current_thr = self.consistent_loss.set_epoch(epoch)
             
             # 严格判断是否需要计算无监督分支
-            compute_unsupervised = (unsup_weight > 1e-6) and has_unlabel
+            compute_unsupervised = (unsup_weight > 1e-6) and has_unlabel and (epoch >= MIN_EPOCH_FOR_UNSUP_FORWARD)
             
             # [LOG] Epoch 开始详细日志
             LOGGER.info(
@@ -1518,7 +1573,7 @@ class DetectionTrainer:
             self.loss_names = "box_loss", "cls_loss"  # 移除 dfl_loss
         # 或在模型中设置 self.model.use_dfl = False
         else:
-            self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+            self.loss_names = "box_loss", "cls_loss"
         return DetectionValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))  # 创建验证器
 
     def get_dataloader(self, dataset_path, batch_size=16, mode="train"):
