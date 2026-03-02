@@ -26,12 +26,12 @@ seed: 0  # (int) 随机种子，用于可复现性
 deterministic: True  # (bool) 是否启用确定性模式
 single_cls: False  # (bool) 将多类数据作为单类进行训练
 rect: False  # (bool) 如果模式为 'train' 则为矩形训练，模式为 'val' 则为矩形验证
-cos_lr: False  # (bool) 是否使用余弦学习率调度
-close_mosaic: 10  # (int) 在最后的周期禁用马赛克增强（0 表示禁用）
-resume: False  # (bool) 从最后的检查点恢复训练
+cos_lr: True  # (bool) 是否使用余弦学习率调度
+close_mosaic: 20  # (int) 在最后的周期禁用马赛克增强（0 表示禁用）
+resume: True  # (bool) 从最后的检查点恢复训练
 amp: False  # (bool) 自动混合精度（AMP）训练，选择项=[True, False]，True 表示运行 AMP 检查
 profile: False  # (bool) 在训练期间记录 ONNX 和 TensorRT 的速度以供日志使用
-freeze: None  # (int | list, optional) 冻结前 n 层，或在训练期间冻结层索引列表
+freeze: 11  # (int | list, optional) 冻结前 n 层，或在训练期间冻结层索引列表 []
 multi_scale: False  # (bool) 是否在训练期间使用多尺度
 # 在 Train settings 区域添加以下参数
 cache: False  # (bool | str) 图像缓存到RAM(True/'ram')或磁盘('disk')加速数据加载
@@ -73,34 +73,43 @@ show_boxes: True  # (bool) 是否显示预测边界框
 line_width:  # (int, optional) 边界框的线宽。如果为 None，则按图像大小缩放。
 
 # 超参数 ------------------------------------------------------------------------------------------------------
-lr0: 0.01  # (float) 初始学习率（例如，SGD=1E-2，Adam=1E-3）
-lrf: 0.01  # (float) 最终学习率（lr0 * lrf）
-momentum: 0.937  # (float) SGD 动量/Adam beta1
-weight_decay: 0.0005  # (float) 优化器权重衰减 5e-4
-warmup_epochs: 3.0  # (float) 热身周期（允许小数）
-warmup_momentum: 0.8  # (float) 热身初始动量
-warmup_bias_lr: 0.1  # (float) 热身初始偏置学习率
-box: 7.5  # (float) 边界框损失增益
-cls: 0.5  # (float) 类别损失增益（与像素缩放）
-dfl: 1.5  # (float) DFL 损失增益
-label_smoothing: 0.0  # (float) 标签平滑（分数）
-nbs: 64  # (int) 名义批量大小
-hsv_h: 0.015  # (float) 图像 HSV-Hue 增强（分数）
-hsv_s: 0.7  # (float) 图像 HSV-Saturation 增强（分数）
-hsv_v: 0.4  # (float) 图像 HSV-Value 增强（分数）
-degrees: 0.0  # (float) 图像旋转（+/- 度）
-translate: 0.1  # (float) 图像平移（+/- 分数）
-scale: 0.5  # (float) 图像缩放（+/- 增益）
-shear: 0.0  # (float) 图像剪切（+/- 度）
-perspective: 0.0  # (float) 图像透视（+/- 分数），范围 0-0.001
-flipud: 0.0  # (float) 图像上下翻转（概率）
-fliplr: 0.5  # (float) 图像左右翻转（概率）
-bgr: 0.0  # (float) 图像通道 BGR（概率）
-mosaic: 1.0  # (float) 图像马赛克（概率）
-mixup: 0.0  # (float) 图像混合（概率）
-copy_paste: 0.0  # (float) 分段复制粘贴（概率）
-copy_paste_mode: "flip"  # (str) 执行复制粘贴增强的方法（翻转、混合）
-auto_augment: randaugment  # (str) 分类的自动增强策略（randaugment、autoaugment、augmix）
+# 1. 优化器相关 (针对SSL稳定性和YOLO26特性)
+lr0: 0.005          # (float) 初始学习率：从0.01降至0.005。SSL场景下高LR易导致伪标签噪声放大，引发震荡。
+lrf: 0.05           # (float) 最终学习率系数：从0.01调至0.05。让学习率衰减得慢一点，利于后期在噪声数据中微调收敛。
+momentum: 0.937     # (float) 动量：保持默认，SGD标准值。
+weight_decay: 0.0005 # (float) 权重衰减：保持默认，防止过拟合。
+warmup_epochs: 5.0  # (float) 热身周期：从3增至5。SSL初期伪标签质量差，需要更长的热身期让模型先适应有标签数据。
+warmup_momentum: 0.8 # (float) 热身动量：保持默认。
+warmup_bias_lr: 0.1 # (float) 热身偏置LR：保持默认。
+
+# 2. 损失函数增益 (适配YOLO26无DFL特性)
+box: 7.5            # (float) 边界框损失：保持默认。
+cls: 1.0            # (float) 类别损失：从0.5提升至1.0。YOLO26是端到端模型，且移除了DFL，需要更强的分类损失来校准置信度，尤其是在伪标签存在类别噪声时。
+dfl: 0.0            # (float) DFL损失：【关键修改】YOLO26架构已移除DFL模块，此参数应设为0或不生效，避免代码逻辑冲突。
+label_smoothing: 0.05 # (float) 标签平滑：从0.0增至0.05。SSL中伪标签硬标签（Hard Label）噪声大，平滑能显著提高鲁棒性。
+
+# 3. 数据增强 (针对VOC小数据集 + SSL噪声抑制)
+nbs: 64             # (int) 名义Batch Size：保持默认（实际训练受限于显存，但影响权重衰减计算）。
+hsv_h: 0.01         # (float) HSV色相：从0.015降至0.01。VOC类别颜色特征明显，过大扰动会破坏语义。
+hsv_s: 0.4          # (float) HSV饱和度：从0.7大幅降至0.4。防止生成过于失真的图像导致伪标签失效。
+hsv_v: 0.2          # (float) HSV亮度：从0.4降至0.2。同上，保持图像真实性。
+degrees: 0.0        # (float) 旋转：保持0.0。VOC物体多为水平，旋转会破坏伪标签的方位一致性。
+translate: 0.1      # (float) 平移：保持默认。
+scale: 0.2          # (float) 缩放：从0.5大幅降至0.2。原0.5意味着0.5x~1.5x，对小目标极不友好且易导致伪标签框越界。改为0.8x~1.2x更稳妥。
+shear: 0.0          # (float) 剪切：保持0.0。剪切会严重扭曲物体形状，干扰端到端模型的几何学习。
+perspective: 0.0    # (float) 透视：保持0.0。
+flipud: 0.0         # (float) 上下翻转：保持0.0。VOC中车、人等物体上下翻转不符合物理常识。
+fliplr: 0.5         # (float) 左右翻转：保持默认，这是最安全的增强。
+bgr: 0.0            # (float) BGR通道交换：保持0.0。
+mosaic: 1.0         # (float) Mosaic概率：保持1.0，但在最后20个epoch自动关闭（需在训练参数设close_mosaic: 20）。
+mixup: 0.0          # (float) Mixup概率：保持0.0。SSL中Mixup会导致两张图的伪标签混合，逻辑复杂且易引入噪声，建议关闭。
+copy_paste: 0.0     # (float) 复制粘贴：保持0.0。
+copy_paste_mode: "flip"
+auto_augment: null  # (str) 自动增强：【关键修改】从randaugment改为null。RandAugment对于VOC这种小数据集过于激进，极易导致过拟合和伪标签失配。
+
+# 4. 隐含建议 (需在训练命令中配合)
+#close_mosaic: 20  #(建议在训练args中设置，提前20轮关闭Mosaic以微调)
+# freeze: 11        (建议冻结Backbone前11层，保护C2PSA注意力机制)
 
 # Export settings ------------------------------------------------------------------------------------------------------
 format: torchscript  # (str) 目标格式: torchscript|onnx|openvino|engine|coreml|saved_model|tflite|etc

@@ -871,7 +871,7 @@ class DetectionTrainer:
             self.plot_metrics()
         self._clear_memory()
 
-    def train(self):
+    def train_successfully1(self):
         """
         修复版训练循环：
         1. 严格根据权重 (sup_weight/unsup_weight) 决定是否计算无监督损失。
@@ -1103,7 +1103,288 @@ class DetectionTrainer:
    
 
 
+    def train(self):
+        """
+        详细日志版训练循环：
+        1. 严格根据权重 (sup_weight/unsup_weight) 决定是否计算无监督损失。
+        2. 使用 LOGGER.info 详细记录权重变化、损失构成、梯度状态及计算模式。
+        3. 优化前向传播路径，避免不必要的计算。
+        """
+        self._setup_train()  # 设置训练
+        nb = len(self.train_loader)  # 批次数
+        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # 热身迭代
+        last_opt_step = -1  # 最后优化步数
+        
+        self.epoch_time = 0
+        self.epoch_time_start = time.time()
+        self.train_time_start = time.time()
+        
+        has_unlabel = self.unlabelloader is not None
+        unlabel_iter = iter(self.unlabelloader) if has_unlabel else None
 
+        # [LOG] 训练启动概览
+        LOGGER.info(
+            f"\n{colorstr('bold', '═'*60)}\n"
+            f"{colorstr('bold', 'YOLO 半监督训练启动')}\n"
+            f"{colorstr('bold', '═'*60)}\n"
+            f'图像大小：{self.args.imgsz} (训练/验证)\n'
+            f"结果目录：{colorstr('bold', self.save_dir)}\n"
+            f"无标签数据加载器：{'已启用' if has_unlabel else '未启用'}\n"
+            f'训练模式：{f"{self.args.time} 小时限时" if self.args.time else f"{self.epochs} 个周期"}\n'
+        )
+
+        if self.args.close_mosaic:
+            base_idx = (self.epochs - self.args.close_mosaic) * nb
+            self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+            
+        epoch = self.start_epoch
+        self.optimizer.zero_grad()
+        
+        while True:
+            self.epoch = epoch
+            
+            # [LOG] 1. 获取并记录权重策略
+            sup_weight, unsup_weight = self.get_dynamic_weights(epoch)
+            
+            # 获取一致性损失的阈值（如果有）
+            current_thr = 0.25
+            if hasattr(self, 'consistent_loss') and hasattr(self.consistent_loss, 'set_epoch'):
+                current_thr = self.consistent_loss.set_epoch(epoch)
+            
+            # 严格判断是否需要计算无监督分支
+            compute_unsupervised = (unsup_weight > 1e-6) and has_unlabel
+            
+            # [LOG] Epoch 开始详细日志
+            LOGGER.info(
+                f"\n{colorstr('blue', '╔' + '═'*58 + '╗')}\n"
+                f"{colorstr('blue', '║')} {colorstr('bold', f'Epoch {epoch + 1}/{self.epochs}')} 开始\n"
+                f"{colorstr('blue', '║')} 学习率：{self.optimizer.param_groups[0]['lr']:.6f}\n"
+                f"{colorstr('blue', '║')} 权重配置 -> 监督：{colorstr('green', f'{sup_weight:.4f}')}, 无监督：{colorstr('magenta', f'{unsup_weight:.4f}')}\n"
+                f"{colorstr('blue', '║')} 置信度阈值：{current_thr:.2f}\n"
+                f"{colorstr('blue', '║')} 计算策略：{colorstr('green', '启用无监督分支') if compute_unsupervised else colorstr('red', '仅监督模式 (权重过低或无数据)')}\n"
+                f"{colorstr('blue', '╚' + '═'*58 + '╝')}"
+            )
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.scheduler.step()
+
+            self.model.train()
+            
+            # 重置无标签迭代器如果需要
+            if has_unlabel and (epoch == self.start_epoch or (epoch == (self.epochs - self.args.close_mosaic))):
+                 if epoch == (self.epochs - self.args.close_mosaic):
+                    self._close_dataloader_mosaic()
+                    self.train_loader.reset()
+                    self.unlabelloader.reset()
+                    unlabel_iter = iter(self.unlabelloader)
+
+            LOGGER.info(self.progress_string())
+            pbar = TQDM(enumerate(self.train_loader), total=nb)
+            
+            self.tloss = None
+            
+            # 用于 Epoch 统计
+            epoch_unsup_count = 0
+            epoch_total_unsup_loss = 0.0
+            
+            for i, batch in pbar:
+                ni = i + nb * epoch
+                
+                # 热身逻辑
+                if ni <= nw:
+                    xi = [0, nw]
+                    self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
+                    for j, x in enumerate(self.optimizer.param_groups):
+                        x["lr"] = np.interp(
+                            ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
+                        )
+                        if "momentum" in x:
+                            x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
+                
+                # 获取无标签批次
+                unlabelbatch = None
+                if compute_unsupervised and unlabel_iter is not None:
+                    try:
+                        unlabelbatch = next(unlabel_iter)
+                    except StopIteration:
+                        unlabel_iter = iter(self.unlabelloader)
+                        unlabelbatch = next(unlabel_iter)
+                    unlabelbatch = self.preprocess_batch(unlabelbatch)
+
+                batch = self.preprocess_batch(batch)
+
+                # 前向传播
+                with autocast(self.amp):
+                    # --- 1. 监督损失 ---
+                    preds = self.model(batch["img"])
+                    self.loss, self.loss_items = self.model(batch)
+                    
+                    if not self.loss.dim() == 0:
+                        self.loss = self.loss.sum()
+                    
+                    # --- 2. 无监督损失 (条件计算) ---
+                    unsupervise_loss = torch.tensor(0.0, device=self.device)
+                    unsupervise_loss_val = 0.0
+                    pseudo_label_count = 0
+                    
+                    if compute_unsupervised and unlabelbatch is not None:
+                        # 教师模型预测
+                        with torch.no_grad():
+                            teacher_preds = self.ema.ema.predict(unlabelbatch['img'])
+                        
+                        # 学生模型预测
+                        student_unsup_preds = self.model(unlabelbatch['img'])
+                        
+                        # 计算一致性损失
+                        raw_unsup_loss, unsup_dict = self.consistent_loss(student_unsup_preds, teacher_preds)
+                        
+                        # 统计伪标签数量 (如果字典中有)
+                        pseudo_label_count = unsup_dict.get("pseudo_labels", 0) if isinstance(unsup_dict, dict) else 0
+                        
+                        # 缩放
+                        unsupervise_loss = raw_unsup_loss * 0.1
+                        
+                        if not unsupervise_loss.dim() == 0:
+                            unsupervise_loss = unsupervise_loss.sum()
+                            
+                        unsupervise_loss_val = unsupervise_loss.item()
+                        epoch_unsup_count += 1
+                        epoch_total_unsup_loss += unsupervise_loss_val
+                        
+                        # [LOG] 每 N 个 batch 或第一个 batch 记录一次无监督细节
+                        if i == 0 or i % (nb // 10) == 0:
+                             LOGGER.info(
+                                f"  [Batch {i}/{nb}] 无监督详情 -> "
+                                f"Loss: {unsupervise_loss_val:.4f}, "
+                                f"伪标签数：{pseudo_label_count}, "
+                                f"加权后贡献：{unsupervise_loss_val * unsup_weight:.4f}"
+                            )
+
+                    # --- 3. 总损失合并 ---
+                    sup_loss_contrib = self.loss.item() * sup_weight
+                    unsup_loss_contrib = unsupervise_loss_val * unsup_weight
+                    total_loss = self.loss * sup_weight + unsupervise_loss * unsup_weight
+                    
+                    # [LOG] 首个 Batch 详细损失分解
+                    if i == 0:
+                        LOGGER.info(
+                            f"  [Batch 0] 损失分解 -> "
+                            f"Sup_Loss(Raw): {self.loss.item():.4f} * {sup_weight:.4f} = {sup_loss_contrib:.4f} | "
+                            f"Unsup_Loss(Raw): {unsupervise_loss_val:.4f} * {unsup_weight:.4f} = {unsup_loss_contrib:.4f} | "
+                            f"Total: {total_loss.item():.4f}"
+                        )
+
+                # 反向传播
+                self.scaler.scale(total_loss).backward()
+                
+                # 更新平均损失
+                self.tloss = (
+                    (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
+                )
+                
+                # 优化步骤
+                if ni - last_opt_step >= self.accumulate:
+                    # [LOG] 优化步前的梯度检查 (可选，调试用)
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0) 
+                    
+                    self.optimizer_step()
+                    self.optimizer.zero_grad()
+                    last_opt_step = ni
+
+                    if self.args.time:
+                        self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
+                        if self.stop:
+                            LOGGER.info(f"\n{colorstr('yellow', '达到限时训练时间，停止训练。')}")
+                            break
+
+                # 进度条显示
+                loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                display_unsup = unsupervise_loss_val if compute_unsupervised else 0.0
+
+                pbar.set_description(
+                    ("%11s" * 2 + "%11.4g" * (2 + loss_length) + " sw:%.3f uw:%.3f ul:%.4g")
+                    % (
+                        f"{epoch + 1}/{self.epochs}",
+                        f"{self._get_memory():.3g}G",
+                        *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
+                        batch["cls"].shape[0],
+                        batch["img"].shape[-1],
+                        sup_weight,
+                        unsup_weight,
+                        display_unsup
+                    )
+                )
+                
+                if self.args.plots and ni in self.plot_idx:
+                    self.plot_training_samples(batch, ni)
+
+            # [LOG] Epoch 结束总结
+            avg_unsup_loss = (epoch_total_unsup_loss / epoch_unsup_count) if epoch_unsup_count > 0 else 0.0
+            LOGGER.info(
+                f"\n{colorstr('cyan', '═'*40)}\n"
+                f"{colorstr('cyan', f'Epoch {epoch + 1} 总结')}\n"
+                f"{colorstr('cyan', '═'*40)}\n"
+                f"无监督分支计算次数：{epoch_unsup_count}/{nb}\n"
+                f"平均无监督损失 (Raw)：{avg_unsup_loss:.4f}\n"
+                f"当前权重状态 -> Sup: {sup_weight:.4f}, Unsup: {unsup_weight:.4f}\n"
+            )
+
+            # 常规 Epoch 结束处理
+            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}
+            final_epoch = epoch + 1 >= self.epochs
+            
+            self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+
+            if self.args.val or final_epoch or getattr(self, 'stopper', None) and self.stopper.possible_stop or self.stop:
+                self.metrics, self.fitness = self.validate()
+            
+            self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+            
+            if hasattr(self, 'stopper'):
+                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
+            else:
+                self.stop |= final_epoch
+                
+            if self.args.time:
+                self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
+
+            if self.args.save or final_epoch:
+                self.save_model()
+                LOGGER.info(f"模型已保存至：{self.save_dir / 'weights' / ('last.pt' if not final_epoch else 'best.pt')}")
+
+            t = time.time()
+            self.epoch_time = t - self.epoch_time_start
+            self.epoch_time_start = t
+            
+            if self.args.time:
+                mean_epoch_time = (t - self.train_time_start) / (epoch - self.start_epoch + 1)
+                self.epochs = self.args.epochs = math.ceil(self.args.time * 3600 / mean_epoch_time)
+                self._setup_scheduler()
+                if hasattr(self.scheduler, 'last_epoch'):
+                    self.scheduler.last_epoch = self.epoch
+                self.stop |= epoch >= self.epochs
+            
+            self._clear_memory()
+
+            if self.stop:
+                break
+            epoch += 1
+
+        # [LOG] 训练完全结束
+        seconds = time.time() - self.train_time_start
+        LOGGER.info(
+            f"\n{colorstr('bold', '═'*60)}\n"
+            f"{colorstr('bold', '训练完成!')}\n"
+            f"{colorstr('bold', '═'*60)}\n"
+            f"总周期数：{epoch - self.start_epoch + 1}\n"
+            f"总耗时：{seconds / 3600:.3f} 小时\n"
+            f"最终评估即将开始...\n"
+        )
+        self.final_eval()
+        if self.args.plots:
+            self.plot_metrics()
+        self._clear_memory()
 
 
 
