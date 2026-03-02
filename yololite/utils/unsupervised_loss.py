@@ -4,9 +4,9 @@ import torch.nn.functional as F
 import math
 from typing import Dict, Tuple, Optional, Union
 
+
 # ==========================================
 # 1. 动态分配器 (DynamicSoftLabelAssigner)
-# 核心逻辑：基于 Cost Matrix 的动态标签分配
 # ==========================================
 class DynamicSoftLabelAssigner(nn.Module):
     def __init__(self, topk: int = 13, iou_factor: float = 3.0, num_classes: int = 80):
@@ -30,25 +30,23 @@ class DynamicSoftLabelAssigner(nn.Module):
             assigned_labels: [B, N]
             assigned_scores: [B, N, C]
             fg_mask:         [B, N]
-            matched_gt_indices: [B, N] - 关键：返回匹配的 GT 索引
+            matched_gt_indices: [B, N]
         """
         bs, n_boxes, _ = pred_scores.shape
         device = pred_scores.device
         
-        # 初始化输出张量
         assigned_labels = torch.full((bs, n_boxes), -1, dtype=torch.long, device=device)
         assigned_scores = torch.zeros_like(pred_scores)
         fg_mask = torch.zeros((bs, n_boxes), dtype=torch.bool, device=device)
         matched_gt_indices = torch.full((bs, n_boxes), -1, dtype=torch.long, device=device)
 
         for b in range(bs):
-            p_score = pred_scores[b]      # [N, C]
-            p_bbox = pred_bboxes[b]       # [N, 4]
+            p_score = pred_scores[b]
+            p_bbox = pred_bboxes[b]
             
-            g_label = gt_labels[b]        # [M]
-            g_bbox = gt_bboxes[b]         # [M, 4]
+            g_label = gt_labels[b]
+            g_bbox = gt_bboxes[b]
             
-            # 应用掩码筛选有效 GT
             if gt_mask is not None:
                 valid_idx = gt_mask[b]
                 if valid_idx.sum() == 0:
@@ -60,7 +58,6 @@ class DynamicSoftLabelAssigner(nn.Module):
             if num_gt == 0:
                 continue
 
-            # --- 1. 计算 IoU Cost ---
             tl = torch.max(p_bbox[:, None, :2], g_bbox[None, :, :2])
             br = torch.min(p_bbox[:, None, 2:], g_bbox[None, :, 2:])
             wh = (br - tl).clamp(min=0)
@@ -68,39 +65,26 @@ class DynamicSoftLabelAssigner(nn.Module):
             area_p = (p_bbox[:, 2] - p_bbox[:, 0]) * (p_bbox[:, 3] - p_bbox[:, 1])
             area_g = (g_bbox[:, 2] - g_bbox[:, 0]) * (g_bbox[:, 3] - g_bbox[:, 1])
             union = area_p[:, None] + area_g[None, :] - inter
-            ious = (inter / (union + 1e-9)).detach()  # [N, M]
+            ious = (inter / (union + 1e-9)).detach()
 
-            # --- 2. 计算 Classification Cost (BCE) ---
-            gt_onehot = F.one_hot(g_label, self.num_classes).float()  # [M, C]
-            # 【关键修复 1】确保预测分数经过 Sigmoid 转换到 (0, 1)
-            # 假设输入的 p_score 是 logits 或未严格约束的概率
-            p_score_sigmoid = torch.sigmoid(p_score) 
-            
-            # 【关键修复 2】防止数值溢出，强制裁剪到 [eps, 1-eps]
+            gt_onehot = F.one_hot(g_label, self.num_classes).float()
+            p_score_sigmoid = torch.sigmoid(p_score)
             eps = 1e-7
             p_score_sigmoid = p_score_sigmoid.clamp(min=eps, max=1.0 - eps)
             
-            # 广播以匹配维度 [N, M, C]
             bce_preds = p_score_sigmoid.unsqueeze(1).expand(-1, num_gt, -1)
             bce_targets = gt_onehot.unsqueeze(0).expand(n_boxes, -1, -1)
-            
-            # 现在输入严格在 (0, 1) 之间，不会再报 CUDA Assertion 错误
-            cls_cost = F.binary_cross_entropy(bce_preds, bce_targets, reduction='none').sum(dim=-1) # [N, M]
+            cls_cost = F.binary_cross_entropy(bce_preds, bce_targets, reduction='none').sum(dim=-1)
 
-            # --- 3. 计算 Distance Cost ---
             p_center = (p_bbox[:, :2] + p_bbox[:, 2:]) / 2.0
             g_center = (g_bbox[:, :2] + g_bbox[:, 2:]) / 2.0
             dist = ((p_center[:, None] - g_center[None, :]) ** 2).sum(dim=-1).sqrt()
-            # 归一化距离成本
             dis_cost = (dist / (dist.max() + 1e-9)) * 10.0
 
-            # 总 Cost
             cost_matrix = cls_cost + ious * self.iou_factor + dis_cost
 
-            # --- 4. Dynamic K Matching (OTA Style) ---
             matching_matrix = torch.zeros_like(cost_matrix)
             candidate_topk = min(self.topk, n_boxes)
-            # 每个 GT 选择 Cost 最小的 TopK 个预测框
             topk_ious, _ = torch.topk(ious, candidate_topk, dim=0)
             dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)
             
@@ -108,14 +92,12 @@ class DynamicSoftLabelAssigner(nn.Module):
                 _, pos_idx = torch.topk(cost_matrix[:, gt_idx], k=dynamic_ks[gt_idx].item(), largest=False)
                 matching_matrix[:, gt_idx][pos_idx] = 1.0
             
-            # 处理一个预测框匹配多个 GT 的情况 -> 保留 Cost 最小的那个
             match_gt_mask = matching_matrix.sum(1) > 1
             if match_gt_mask.sum() > 0:
                 cost_min, cost_argmin = torch.min(cost_matrix[match_gt_mask, :], dim=1)
                 matching_matrix[match_gt_mask, :] *= 0.0
                 matching_matrix[match_gt_mask, cost_argmin] = 1.0
             
-            # 确定前景掩码和匹配索引
             fg_mask_b = matching_matrix.sum(1) > 0.0
             if fg_mask_b.sum() > 0:
                 matched_inds = matching_matrix[fg_mask_b, :].argmax(dim=1)
@@ -127,15 +109,11 @@ class DynamicSoftLabelAssigner(nn.Module):
 
         return assigned_labels, assigned_scores, fg_mask, matched_gt_indices
 
-# ==========================================
-# 2. 严格的数据提取与坐标转换工具
-# ==========================================
 
+# ==========================================
+# 2. 坐标转换工具
+# ==========================================
 def cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
-    """
-    将 (cx, cy, w, h) 转换为 (x1, y1, x2, y2)
-    输入形状：[..., 4]
-    """
     if boxes.shape[-1] != 4:
         raise ValueError(f"Expected box dimension to be 4, got {boxes.shape[-1]}")
     
@@ -146,28 +124,18 @@ def cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     y2 = cy + 0.5 * h
     return torch.stack([x1, y1, x2, y2], dim=-1)
 
+
 def extract_predictions_strict(preds: Union[Dict, Tuple], branch_name: str = 'one2one') -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    【严格模式】从 YOLO 输出结构中提取 boxes 和 scores。
-    如果键不存在，直接抛出 KeyError，拒绝任何隐式假设或占位符。
-    
-    支持结构:
-    1. Dict: {'one2one': {'boxes': ..., 'scores': ...}}
-    2. Tuple: (raw_tensor, {'one2one': {'boxes': ..., 'scores': ...}})
-    """
     data_dict = None
     
-    # 情况 A: 输入是 Dict (Student)
     if isinstance(preds, dict):
         if branch_name not in preds:
             raise KeyError(f"Branch '{branch_name}' not found in student prediction dict. Keys: {preds.keys()}")
         data_dict = preds[branch_name]
         
-    # 情况 B: 输入是 Tuple (Teacher)
     elif isinstance(preds, tuple):
         if len(preds) < 2:
             raise ValueError(f"Teacher prediction tuple expected at least 2 elements, got {len(preds)}")
-        # 通常第二个元素是处理后的字典
         processed_dict = preds[1]
         if not isinstance(processed_dict, dict):
             raise TypeError(f"Expected second element of teacher tuple to be dict, got {type(processed_dict)}")
@@ -182,7 +150,6 @@ def extract_predictions_strict(preds: Union[Dict, Tuple], branch_name: str = 'on
     if not isinstance(data_dict, dict):
         raise TypeError(f"Branch data must be a dict, got {type(data_dict)}")
 
-    # 【严格检查】必须同时存在 boxes 和 scores
     if 'boxes' not in data_dict:
         raise KeyError(f"'boxes' key missing in branch '{branch_name}'. Available keys: {data_dict.keys()}")
     if 'scores' not in data_dict:
@@ -191,157 +158,26 @@ def extract_predictions_strict(preds: Union[Dict, Tuple], branch_name: str = 'on
     boxes = data_dict['boxes']
     scores = data_dict['scores']
 
-    # 检查 boxes 维度：如果是 [B, 4, N]，则转换为 [B, N, 4]
     if boxes.dim() == 3 and boxes.shape[1] == 4:
         boxes = boxes.permute(0, 2, 1).contiguous()
     elif boxes.dim() != 3 or boxes.shape[-1] != 4:
-        # 如果既不是 [B, 4, N] 也不是 [B, N, 4]，则报错
         raise ValueError(f"Unexpected boxes shape: {boxes.shape}. Expected [B, 4, N] or [B, N, 4].")
     
-    # 检查 scores 维度：如果是 [B, C, N]，则转换为 [B, N, C]
-    # 注意：这里假设 C (类别数) 不等于 N (锚点数)。通常 N=8400, C=80。
-    if scores.dim() == 3 and scores.shape[1] != scores.shape[2] and scores.shape[1] < 1000: 
-        # 简单判断：如果中间维度远小于最后维度，且中间维度大概是类别数 (如 80)，则认为是 [B, C, N]
-        # 更严谨的判断是检查 shape[1] 是否等于 num_classes，但这里我们没有 num_classes 变量传入
-        # 最稳妥的方式：如果 shape[1] == 4 (不可能，那是 box) 或者 shape[1] 很小 (如 80)，而 shape[2] 很大 (8400)
+    if scores.dim() == 3 and scores.shape[1] != scores.shape[2] and scores.shape[1] < 1000:
         if scores.shape[2] > scores.shape[1]: 
              scores = scores.permute(0, 2, 1).contiguous()
     
-    # 最终校验
     if boxes.dim() != 3 or boxes.shape[-1] != 4:
         raise ValueError(f"Final boxes shape check failed: Expected [B, N, 4], got {boxes.shape}")
     if scores.dim() != 3:
         raise ValueError(f"Final scores shape check failed: Expected [B, N, C], got {scores.shape}")
     
     return boxes, scores
-    
-    return boxes, scores
+
 
 # ==========================================
-# 3. 主 Loss 类 (YOLO26ConsistencyLoss)
+# 3. IoU Loss (保持不变)
 # ==========================================
-
-class YOLO26ConsistencyLoss(nn.Module):
-    def __init__(self, box_weight: float = 1.0, cls_weight: float = 1.0, 
-                 temperature: float = 1.0, confidence_threshold: float = 0.25, 
-                 num_classes: int = 80, topk: int = 13):
-        super().__init__()
-        self.box_weight = box_weight
-        self.cls_weight = cls_weight
-        self.temperature = temperature
-        self.confidence_threshold = confidence_threshold
-        self.num_classes = num_classes
-        
-        self.iou_loss = IOUloss(reduction="none", iou_type="ciou", xyxy=True)
-        self.assigner = DynamicSoftLabelAssigner(topk=topk, num_classes=num_classes)
-
-    def forward(self, student_pred: Union[Dict, Tuple], teacher_pred: Union[Dict, Tuple]) -> Tuple[torch.Tensor, Dict]:
-        """
-        计算无监督一致性损失。
-        流程：严格提取 -> 坐标转换 -> 逐图动态分配 -> 计算 Loss
-        """
-        # 1. 【严格提取】如果结构不对，这里会直接报错，方便调试
-        s_boxes_raw, s_scores = extract_predictions_strict(student_pred, branch_name='one2one')
-        t_boxes_raw, t_scores = extract_predictions_strict(teacher_pred, branch_name='one2one')
-        
-        # 2. 坐标格式统一：YOLO 内部通常是 cxcywh，IoU 需要 xyxy
-        s_boxes = cxcywh_to_xyxy(s_boxes_raw)
-        t_boxes = cxcywh_to_xyxy(t_boxes_raw)
-        
-        B, N, _ = s_boxes.shape
-        device = s_boxes.device
-        
-        total_box_loss = 0.0
-        total_cls_loss = 0.0
-        valid_samples_count = 0
-
-        # 3. 逐图处理 (解决 Batch Mismatch 问题)
-        for b in range(B):
-            sb_box = s_boxes[b:b+1]      # [1, N, 4]
-            sb_score = s_scores[b:b+1]   # [1, N, C]
-            tb_box = t_boxes[b:b+1]
-            tb_score = t_scores[b:b+1]
-
-            # 生成伪标签 (Pseudo-GT)
-            # 获取 Teacher 的最大置信度和对应类别
-            t_conf, t_cls = tb_score.max(dim=-1) # [1, N]
-            
-            # 阈值筛选
-            pseudo_gt_mask = (t_conf.squeeze(0) > self.confidence_threshold)
-            
-            if pseudo_gt_mask.sum() == 0:
-                continue
-            
-            # 提取有效的 GT 数据和对应的 Box
-            gt_bboxes = tb_box.squeeze(0)[pseudo_gt_mask] # [M, 4]
-            gt_labels = t_cls.squeeze(0)[pseudo_gt_mask]  # [M]
-            
-            if gt_bboxes.shape[0] == 0:
-                continue
-
-           # 【修复点】构造与筛选后 GT 数量匹配的掩码 (全 True)，或者直接传 None
-            # 原代码错误地传入了长度为 N 的 pseudo_gt_mask
-            # 正确做法：既然已经筛选了，传入的 GT 都是有效的，不需要掩码，或者传入长度为 M 的全 True 掩码
-            current_gt_mask = torch.ones_like(gt_labels, dtype=torch.bool) # 形状 [M]
-
-            # 4. 动态标签分配 (ASA Module)
-            assigned_labels, assigned_scores, fg_mask, matched_gt_indices = self.assigner(
-                pred_scores=sb_score,             # [1, N, C]
-                pred_bboxes=sb_box,               # [1, N, 4]
-                gt_labels=gt_labels.unsqueeze(0), # [1, M]
-                gt_bboxes=gt_bboxes.unsqueeze(0), # [1, M, 4]
-                # gt_mask=pseudo_gt_mask.unsqueeze(0) # ❌ 错误：形状是 [1, N]，与 gt_labels [1, M] 不匹配
-                gt_mask=current_gt_mask.unsqueeze(0) # ✅ 正确：形状是 [1, M]，与 gt_labels 匹配
-            )
-            fg_mask_b = fg_mask[0] # [N]
-            if fg_mask_b.sum() == 0:
-                continue
-            
-            # 5. 获取匹配的 Target Boxes (利用返回的 indices)
-            matched_indices = matched_gt_indices[0][fg_mask_b]
-            
-            # 安全检查
-            if matched_indices.numel() == 0 or matched_indices.min() < 0:
-                continue
-                
-            target_boxes = gt_bboxes[matched_indices]       # [K, 4]
-            # target_labels = gt_labels[matched_indices]    # 如果需要分类硬标签
-            
-            s_pos_boxes = sb_box.squeeze(0)[fg_mask_b]      # [K, 4]
-            s_pos_scores = sb_score.squeeze(0)[fg_mask_b]   # [K, C]
-            t_soft_scores = assigned_scores[0][fg_mask_b]   # [K, C]
-
-            # 6. 计算损失
-            # Box Loss (CIoU)
-            box_loss_val = self.iou_loss(s_pos_boxes, target_boxes)
-            total_box_loss += box_loss_val.sum()
-            
-            # Class Loss (KL Divergence with Soft Targets)
-            eps = 1e-9
-            log_student = F.log_softmax(s_pos_scores / self.temperature, dim=-1)
-            kl_div = (t_soft_scores * (torch.log(t_soft_scores + eps) - log_student)).sum(dim=-1)
-            total_cls_loss += kl_div.sum()
-            
-            valid_samples_count += fg_mask_b.sum()
-
-        # 7. 归一化
-        if valid_samples_count == 0:
-            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero_loss, {
-                "cons_box": 0.0, "cons_cls": 0.0, "cons_total": 0.0, "valid_ratio": 0.0
-            }
-
-        box_loss = total_box_loss / valid_samples_count
-        cls_loss = total_cls_loss / valid_samples_count
-        total_loss = self.box_weight * box_loss + self.cls_weight * cls_loss
-
-        return total_loss, {
-            "cons_box": box_loss.item(),
-            "cons_cls": cls_loss.item(),
-            "cons_total": total_loss.item(),
-            "valid_ratio": float(valid_samples_count) / (B * N)
-        }
-
 class IOUloss(nn.Module):
     def __init__(self, reduction: str = "none", iou_type: str = "ciou", xyxy: bool = True):
         super().__init__()
@@ -353,7 +189,6 @@ class IOUloss(nn.Module):
         pred = pred.view(-1, 4).float()
         target = target.view(-1, 4).float()
         
-        # 假设输入已经是 xyxy (由 forward 中的转换保证)
         tl = torch.max(pred[:, :2], target[:, :2])
         br = torch.min(pred[:, 2:], target[:, 2:])
         hw = (br - tl).clamp(min=0)
@@ -392,3 +227,173 @@ class IOUloss(nn.Module):
         elif self.reduction == "sum":
             loss = loss.sum()
         return loss
+
+
+# ==========================================
+# 4. 修改后的主 Loss 类 (YOLO26ConsistencyLoss)
+# 关键修改：动态阈值 + epoch 感知
+# ==========================================
+
+class YOLO26ConsistencyLoss(nn.Module):
+    def __init__(
+        self, 
+        box_weight: float = 1.0, 
+        cls_weight: float = 1.0, 
+        temperature: float = 1.0, 
+        # 动态阈值参数：早期高阈值减少噪声，后期降低增加召回
+        confidence_threshold_start: float = 0.5,    # 初始高阈值
+        confidence_threshold_end: float = 0.25,      # 最终低阈值
+        threshold_warmup_epochs: int = 50,           # 阈值过渡周期
+        total_epochs: int = 175,                     # 总训练轮数
+        num_classes: int = 80, 
+        topk: int = 13
+    ):
+        super().__init__()
+        self.box_weight = box_weight
+        self.cls_weight = cls_weight
+        self.temperature = temperature
+        
+        # 动态阈值相关参数
+        self.confidence_threshold_start = confidence_threshold_start
+        self.confidence_threshold_end = confidence_threshold_end
+        self.threshold_warmup_epochs = threshold_warmup_epochs
+        self.total_epochs = total_epochs
+        
+        # 当前状态
+        self.current_epoch = 0
+        self.confidence_threshold = confidence_threshold_start  # 初始值
+        
+        self.num_classes = num_classes
+        
+        self.iou_loss = IOUloss(reduction="none", iou_type="ciou", xyxy=True)
+        self.assigner = DynamicSoftLabelAssigner(topk=topk, num_classes=num_classes)
+
+    def set_epoch(self, epoch: int):
+        """
+        设置当前 epoch，更新动态阈值
+        应在每个 epoch 开始时调用
+        """
+        self.current_epoch = epoch
+        
+        # 计算阈值过渡进度 (0 到 1)
+        if epoch >= self.threshold_warmup_epochs:
+            progress = 1.0
+        else:
+            progress = epoch / self.threshold_warmup_epochs
+        
+        # 线性降低阈值：从高阈值过渡到低阈值
+        # 也可以使用余弦退火：progress = (1 - math.cos(progress * math.pi)) / 2
+        self.confidence_threshold = self.confidence_threshold_start + \
+            (self.confidence_threshold_end - self.confidence_threshold_start) * progress
+        
+        return self.confidence_threshold
+
+    def get_current_threshold(self) -> float:
+        """获取当前阈值，用于日志记录"""
+        return self.confidence_threshold
+
+    def forward(
+        self, 
+        student_pred: Union[Dict, Tuple], 
+        teacher_pred: Union[Dict, Tuple]
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        计算无监督一致性损失，使用动态阈值
+        """
+        # 严格提取预测
+        s_boxes_raw, s_scores = extract_predictions_strict(student_pred, branch_name='one2one')
+        t_boxes_raw, t_scores = extract_predictions_strict(teacher_pred, branch_name='one2one')
+        
+        # 坐标转换
+        s_boxes = cxcywh_to_xyxy(s_boxes_raw)
+        t_boxes = cxcywh_to_xyxy(t_boxes_raw)
+        
+        B, N, _ = s_boxes.shape
+        device = s_boxes.device
+        
+        total_box_loss = 0.0
+        total_cls_loss = 0.0
+        valid_samples_count = 0
+        total_pseudo_labels = 0  # 统计伪标签数量，用于监控
+
+        for b in range(B):
+            sb_box = s_boxes[b:b+1]
+            sb_score = s_scores[b:b+1]
+            tb_box = t_boxes[b:b+1]
+            tb_score = t_scores[b:b+1]
+
+            # 生成伪标签
+            t_conf, t_cls = tb_score.max(dim=-1)
+            
+            # 使用动态阈值筛选
+            pseudo_gt_mask = (t_conf.squeeze(0) > self.confidence_threshold)
+            num_pseudo = pseudo_gt_mask.sum().item()
+            total_pseudo_labels += num_pseudo
+            
+            if num_pseudo == 0:
+                continue
+            
+            gt_bboxes = tb_box.squeeze(0)[pseudo_gt_mask]
+            gt_labels = t_cls.squeeze(0)[pseudo_gt_mask]
+
+            # 构造有效掩码（与筛选后的GT匹配）
+            current_gt_mask = torch.ones_like(gt_labels, dtype=torch.bool)
+
+            # 动态标签分配
+            assigned_labels, assigned_scores, fg_mask, matched_gt_indices = self.assigner(
+                pred_scores=sb_score,
+                pred_bboxes=sb_box,
+                gt_labels=gt_labels.unsqueeze(0),
+                gt_bboxes=gt_bboxes.unsqueeze(0),
+                gt_mask=current_gt_mask.unsqueeze(0)
+            )
+            
+            fg_mask_b = fg_mask[0]
+            if fg_mask_b.sum() == 0:
+                continue
+            
+            matched_indices = matched_gt_indices[0][fg_mask_b]
+            
+            if matched_indices.numel() == 0 or matched_indices.min() < 0:
+                continue
+                
+            target_boxes = gt_bboxes[matched_indices]
+            s_pos_boxes = sb_box.squeeze(0)[fg_mask_b]
+            s_pos_scores = sb_score.squeeze(0)[fg_mask_b]
+            t_soft_scores = assigned_scores[0][fg_mask_b]
+
+            # 计算损失
+            box_loss_val = self.iou_loss(s_pos_boxes, target_boxes)
+            total_box_loss += box_loss_val.sum()
+            
+            eps = 1e-9
+            log_student = F.log_softmax(s_pos_scores / self.temperature, dim=-1)
+            kl_div = (t_soft_scores * (torch.log(t_soft_scores + eps) - log_student)).sum(dim=-1)
+            total_cls_loss += kl_div.sum()
+            
+            valid_samples_count += fg_mask_b.sum()
+
+        # 归一化
+        if valid_samples_count == 0:
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero_loss, {
+                "cons_box": 0.0, 
+                "cons_cls": 0.0, 
+                "cons_total": 0.0, 
+                "valid_ratio": 0.0,
+                "pseudo_labels": 0,
+                "threshold": self.confidence_threshold
+            }
+
+        box_loss = total_box_loss / valid_samples_count
+        cls_loss = total_cls_loss / valid_samples_count
+        total_loss = self.box_weight * box_loss + self.cls_weight * cls_loss
+
+        return total_loss, {
+            "cons_box": box_loss.item(),
+            "cons_cls": cls_loss.item(),
+            "cons_total": total_loss.item(),
+            "valid_ratio": float(valid_samples_count) / (B * N),
+            "pseudo_labels": total_pseudo_labels // B,  # 平均每张图的伪标签数
+            "threshold": self.confidence_threshold
+        }

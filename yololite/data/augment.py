@@ -8,10 +8,11 @@ import cv2
 import numpy as np
 import torch
 
-from yololite.utils import LOGGER, colorstr
+from yololite.utils import LOGGER, IterableSimpleNamespace, colorstr
 from yololite.utils.checks import check_version
 from yololite.utils.instance import Instances
 from yololite.utils.metrics import bbox_ioa
+from torch.distributions import Dirichlet
 
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
 DEFAULT_STD = (1.0, 1.0, 1.0)
@@ -959,14 +960,18 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
     """
     Applies a series of image transformations for training.
 
-    This function creates a composition of image augmentation techniques to prepare images for YOLO training.
-    It includes operations such as mosaic, copy-paste, random perspective, mixup, and various color adjustments.
+    This function creates a composition of image augmentation techniques to prepare images for YOLO training. It
+    includes operations such as mosaic, copy-paste, random perspective, mixup, and various color adjustments.
 
     Args:
         dataset (Dataset): The dataset object containing image data and annotations.
         imgsz (int): The target image size for resizing.
-        hyp (Dict): A dictionary of hyperparameters controlling various aspects of the transformations.
+        hyp (IterableSimpleNamespace): A dictionary of hyperparameters controlling various aspects of the
+            transformations.
         stretch (bool): If True, applies stretching to the image. If False, uses LetterBox resizing.
+        k (int): Number of transforms to randomly sample from the pool (default: 5).
+        alpha (float): Dirichlet concentration parameter for sampling weights (default: 1.0).
+        enable_random_subset (bool): If True, enables random subset selection of transforms.
 
     Returns:
         (Compose): A composition of image transformations to be applied to the dataset.
