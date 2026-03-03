@@ -28,7 +28,7 @@ single_cls: False  # (bool) 将多类数据作为单类进行训练
 rect: False  # (bool) 如果模式为 'train' 则为矩形训练，模式为 'val' 则为矩形验证
 cos_lr: True  # (bool) 是否使用余弦学习率调度
 close_mosaic: 20  # (int) 在最后的周期禁用马赛克增强（0 表示禁用）
-resume: True  # (bool) 从最后的检查点恢复训练
+resume: False  # (bool) 从最后的检查点恢复训练
 amp: False  # (bool) 自动混合精度（AMP）训练，选择项=[True, False]，True 表示运行 AMP 检查
 profile: False  # (bool) 在训练期间记录 ONNX 和 TensorRT 的速度以供日志使用
 freeze: 11  # (int | list, optional) 冻结前 n 层，或在训练期间冻结层索引列表 []

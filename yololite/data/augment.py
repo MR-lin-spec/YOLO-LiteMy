@@ -1009,3 +1009,102 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]
     )  # transforms
+class WeakAugmentation:
+    """
+    定义弱增强集合，用于半监督学习中的弱增强分支
+    """
+    def __init__(self, imgsz, hyp):
+        self.imgsz = imgsz
+        self.hyp = hyp
+        # 构建弱增强变换链
+        self.transforms = self._build_weak_augmentation()
+    
+    def _build_weak_augmentation(self):
+        """
+        构建弱增强变换，相比强增强减少了变换种类和强度
+        """
+        from yololite.data.augment import (
+            Compose,
+            Format,
+            LetterBox,
+            RandomFlip,
+            RandomHSV
+        )
+        
+        # 弱增强只包括基本的几何变换和轻微的颜色扰动
+        transforms = []
+        
+        # 1. 基本尺寸调整（可选）
+        if self.hyp.get('letterbox', True):
+            transforms.append(LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False))
+        
+        # 2. 轻微的颜色扰动（降低强度）
+        if self.hyp.get('weak_color_jitter', True):
+            transforms.append(RandomHSV(
+                hgain=min(0.1, self.hyp.get('hsv_h', 0.5)),  # 降低HSV增益
+                sgain=min(0.1, self.hyp.get('hsv_s', 0.5)),
+                vgain=min(0.1, self.hyp.get('hsv_v', 0.5))
+            ))
+        
+        # 3. 轻微翻转
+        if self.hyp.get('weak_flip', True):
+            transforms.append(RandomFlip(
+                p=self.hyp.get('weak_flip_prob', 0.2),  # 降低翻转概率
+                direction="horizontal"
+            ))
+        
+        # 4. 格式化输出
+        transforms.append(Format(
+            bbox_format="xywh",
+            normalize=True,
+            batch_idx=True,
+            bgr=self.hyp.get('bgr', 0.0)
+        ))
+        
+        return Compose(transforms)
+    
+    def __call__(self, data):
+        """
+        应用弱增强变换
+        """
+        return self.transforms(data)
+
+def weak_v8_transforms(dataset, imgsz, hyp):
+    """
+    构建弱增强变换链，与v8_transforms类似但强度更低
+    """
+    from yololite.data.augment import (
+        Compose,
+        Format,
+        LetterBox,
+        RandomFlip,
+        RandomHSV
+    )
+    
+    transforms = []
+    
+    # 使用LetterBox进行基本尺寸调整
+    transforms.append(LetterBox(new_shape=(imgsz, imgsz), scaleup=False))
+    
+    # 轻微颜色扰动
+    transforms.append(RandomHSV(
+        hgain=min(0.1, hyp.get('hsv_h', 0.5)),
+        sgain=min(0.1, hyp.get('hsv_s', 0.5)),
+        vgain=min(0.1, hyp.get('hsv_v', 0.5))
+    ))
+    
+    # 轻微水平翻转
+    transforms.append(RandomFlip(
+        p=min(0.2, hyp.get('fliplr', 0.5)),
+        direction="horizontal"
+    ))
+    
+    # 格式化输出
+    transforms.append(Format(
+        bbox_format="xywh",
+        normalize=True,
+        batch_idx=True,
+        bgr=hyp.get('bgr', 0.0)
+    ))
+    
+    return Compose(transforms)

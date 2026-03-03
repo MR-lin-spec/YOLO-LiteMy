@@ -147,6 +147,7 @@ class DetectionTrainer:
             self.args.unlabeldata = data["yaml_file"]
         self.unlabel_data = data
         return data.get("train")  # 返回无标签训练集路径
+
     def get_unlabeldataloader(self, dataset_path, batch_size=16):
         """构建并返回无标签数据加载器。"""
         if dataset_path is None:
@@ -155,6 +156,7 @@ class DetectionTrainer:
         shuffle = True
         workers = self.args.workers
         return build_unlabeleddataloader(dataset, batch_size, workers, shuffle)
+
     
     def get_dynamic_weights(self, epoch):
         """
@@ -209,6 +211,10 @@ class DetectionTrainer:
         # 计算当前的无监督权重 (从 0 线性/曲线增长到 MAX_UNSUP_RATIO)
         unsup_weight = self.unsupervised_weight_start + \
                        (MAX_UNSUP_RATIO - self.unsupervised_weight_start) * cosine_factor
+         # 【新增】如果超过过渡期，让无监督权重线性衰减到 0
+        if current_epoch >= end_ep:
+            decay_progress = (current_epoch - end_ep) / (self.epochs - end_ep)
+            unsup_weight = MAX_UNSUP_RATIO * (1.0 - decay_progress) # 从 0.45 线性降到 0
         
         # 再次确保不超标 (防御性编程)
         unsup_weight = min(unsup_weight, MAX_UNSUP_RATIO)
@@ -225,9 +231,110 @@ class DetectionTrainer:
     
     
     
-    
-    
     def _setup_train(self):
+        """构建数据加载器和优化器。"""
+        # 模型设置
+        ckpt = self.setup_model()  # 设置模型
+        self.model = self.model.to(self.device)  # 将模型移至设备
+        self.set_model_attributes()  # 设置模型属性
+
+        # 冻结层设置
+        freeze_list = (
+            self.args.freeze
+            if isinstance(self.args.freeze, list)
+            else range(self.args.freeze)
+            if isinstance(self.args.freeze, int)
+            else []
+        )
+        self.best_map50 = 0.0  # 初始化最佳 mAP50
+        self.current_map50 = 0.0  # 初始化当前 mAP50
+        always_freeze_names = [".dfl"]  # 始终冻结的层
+        freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
+        for k, v in self.model.named_parameters():
+            if any(x in k for x in freeze_layer_names):
+                LOGGER.info(f"冻结层 '{k}'")
+                v.requires_grad = False  # 冻结参数
+            elif not v.requires_grad and v.dtype.is_floating_point:  # 仅浮点类型可以要求梯度
+                LOGGER.info(
+                    f"警告 ⚠️ 设置 'requires_grad=True' 为冻结层 '{k}'。"
+                )
+                v.requires_grad = True
+
+        # 检查 AMP
+        self.amp = torch.tensor(self.args.amp).to(self.device)  # 是否启用 AMP
+        if self.amp:  # 单 GPU
+            self.model = self.model.to(self.device)  # 移动模型到指定设备
+        self.amp = bool(self.amp)  # 转为布尔值
+        self.scaler = (
+            torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
+        )
+
+        # 检查图像大小
+        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # 网格大小
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)  # 检查图像大小
+        self.stride = gs  # 用于多尺度训练
+
+        # 数据加载器
+        batch_size = self.batch_size
+        self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, mode="train")
+        # 【关键新增】创建无标签数据加载器
+        unlabel_path = self.get_unlabeldataset()
+        if unlabel_path:
+            self.unlabelloader = self.get_unlabeldataloader(unlabel_path, batch_size=batch_size)
+            LOGGER.info(f"成功创建无标签数据加载器，路径: {unlabel_path}")
+        else:
+            self.unlabelloader = None
+            LOGGER.info("未配置或未找到无标签数据，将以纯监督模式训练。")
+        # 测试数据加载器
+        self.test_loader = self.get_dataloader(self.testset, batch_size=batch_size * 2, mode="val")
+        self.validator = self.get_validator()  # 获取验证器
+        metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")  # 指标键
+        self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))  # 初始化指标
+
+        self.ema = ModelEMA(self.model)  # 初始化 EMA
+        if self.args.plots:
+            self.plot_training_labels()  # 绘制训练标签
+
+        # 优化器设置
+        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # 优化前累积损失
+        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # 权重衰减
+        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs  # 迭代次数
+        self.optimizer = self.build_optimizer(
+            model=self.model,
+            name=self.args.optimizer,
+            lr=self.args.lr0,
+            momentum=self.args.momentum,
+            decay=weight_decay,
+            iterations=iterations,
+        )
+        #权重设置
+        # 在 _setup_train() 方法中添加（在 consistent_loss 初始化之后）
+        self.supervised_weight_start = 1.0  # 初始监督损失权重
+        self.supervised_weight_end = 0.0    # 最终监督损失权重
+        self.unsupervised_weight_start = 0.0  # 初始无监督损失权重
+        self.unsupervised_weight_end = 1.0    # 最终无监督损失权重
+        # 权重过渡策略参数
+        self.weight_transition_start_epoch = max(10, int(self.epochs * 0.2)) 
+        self.weight_transition_end_epoch = self.epochs-5 # 结束过渡的epoch
+        num_classes = self.data.get("nc", 80) 
+        self.consistent_loss = YOLO26ConsistencyLoss(
+            box_weight=1.0,
+            cls_weight=1.0,
+            temperature=1.0,
+            #confidence_threshold_start=0.5,    # 前20轮用0.5，减少噪声
+            #confidence_threshold_end=0.25,      # 后期降到0.25，增加召回
+            threshold_warmup_epochs=50,         # 50轮完成过渡
+            total_epochs=self.epochs,           # 175
+            num_classes=num_classes,
+            
+        )
+        # 设置学习率调度器
+        self._setup_scheduler()
+        self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False  # 提前停止
+        self.resume_training(ckpt)  # 恢复训练
+        self.scheduler.last_epoch = self.start_epoch - 1  # 不移动
+    
+    def _setup_train_old(self):
         """构建数据加载器和优化器。"""
         # 模型设置
         ckpt = self.setup_model()  # 设置模型
@@ -1167,7 +1274,7 @@ class DetectionTrainer:
         """
         self._setup_train()  # 设置训练
         nb = len(self.train_loader)  # 批次数
-        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # 热身迭代
+        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # 热温迭代
         last_opt_step = -1  # 最后优化步数
         
         self.epoch_time = 0
@@ -1284,12 +1391,17 @@ class DetectionTrainer:
                     pseudo_label_count = 0
                     
                     if compute_unsupervised and unlabelbatch is not None:
+                        # 使用弱增强图像作为教师模型输入
+                        teacher_weak_img = unlabelbatch['weak_img']
+                        # 使用强增强图像作为学生模型输入
+                        student_strong_img = unlabelbatch['strong_img']
+                        
                         # 教师模型预测
                         with torch.no_grad():
-                            teacher_preds = self.ema.ema.predict(unlabelbatch['img'])
+                            teacher_preds = self.ema.ema.predict(teacher_weak_img)
                         
                         # 学生模型预测
-                        student_unsup_preds = self.model(unlabelbatch['img'])
+                        student_unsup_preds = self.model(student_strong_img)
                         
                         # 计算一致性损失
                         raw_unsup_loss, unsup_dict = self.consistent_loss(student_unsup_preds, teacher_preds)
@@ -1308,7 +1420,7 @@ class DetectionTrainer:
                         epoch_total_unsup_loss += unsupervise_loss_val
                         
                         # [LOG] 每 N 个 batch 或第一个 batch 记录一次无监督细节
-                        if i == 0 or i % (nb // 10) == 0:
+                        if i == 0 or i % (nb // 5) == 0:
                              LOGGER.info(
                                 f"  [Batch {i}/{nb}] 无监督详情 -> "
                                 f"Loss: {unsupervise_loss_val:.4f}, "
@@ -1443,7 +1555,6 @@ class DetectionTrainer:
 
 
 
-
     def _get_memory(self):
         """获取加速器的内存利用率（单位：GB）。"""
         if self.device.type == "mps":
@@ -1533,7 +1644,7 @@ class DetectionTrainer:
         if self.ema:
             self.ema.update(self.model)  # 更新 EMA
 
-    def preprocess_batch(self, batch):
+    def preprocess_batch_old(self, batch):
         """预处理一批图像，进行缩放并转换为浮点数。"""
         batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255  # 转换图像
         if self.args.multi_scale:
@@ -1551,6 +1662,71 @@ class DetectionTrainer:
                 imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)  # 重新调整图像大小
             batch["img"] = imgs  # 更新批次图像
         return batch
+
+
+
+
+    def preprocess_batch(self, batch):
+        """预处理一批图像，进行缩放并转换为浮点数。"""
+        # 检查是否为无标签数据批次（包含强增强和弱增强图像）
+        if 'strong_img' in batch and 'weak_img' in batch:
+            # 预处理强增强图像
+            batch["strong_img"] = batch["strong_img"].to(self.device, non_blocking=True).float() / 255
+            # 预处理弱增强图像
+            batch["weak_img"] = batch["weak_img"].to(self.device, non_blocking=True).float() / 255
+        else:
+            # 有标签数据的预处理
+            batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+        
+        # 多尺度训练
+        if self.args.multi_scale:
+            if 'strong_img' in batch and 'weak_img' in batch:
+                # 处理无标签数据的多尺度
+                strong_imgs = batch["strong_img"]
+                weak_imgs = batch["weak_img"]
+                
+                sz = (
+                    random.randrange(int(self.args.imgsz * 0.5), int(self.args.imgsz * 1.5 + self.stride))
+                    // self.stride
+                    * self.stride
+                )  # 随机大小
+                sf = sz / max(strong_imgs.shape[2:])  # 缩放因子
+                if sf != 1:
+                    ns = [
+                        math.ceil(x * sf / self.stride) * self.stride for x in strong_imgs.shape[2:]
+                    ]  # 新形状（拉伸到网格倍数）
+                    strong_imgs = nn.functional.interpolate(strong_imgs, size=ns, mode="bilinear", align_corners=False)  # 重新调整图像大小
+                    weak_imgs = nn.functional.interpolate(weak_imgs, size=ns, mode="bilinear", align_corners=False)  # 重新调整图像大小
+                batch["strong_img"] = strong_imgs  # 更新批次图像
+                batch["weak_img"] = weak_imgs  # 更新批次图像
+            else:
+                # 处理有标签数据的多尺度
+                imgs = batch["img"]
+                sz = (
+                    random.randrange(int(self.args.imgsz * 0.5), int(self.args.imgsz * 1.5 + self.stride))
+                    // self.stride
+                    * self.stride
+                )  # 随机大小
+                sf = sz / max(imgs.shape[2:])  # 缩放因子
+                if sf != 1:
+                    ns = [
+                        math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
+                    ]  # 新形状（拉伸到网格倍数）
+                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)  # 重新调整图像大小
+                batch["img"] = imgs  # 更新批次图像
+        return batch
+
+
+
+
+
+
+
+
+
+
+
+
 
     def validate(self):
         """验证模型并返回指标。"""

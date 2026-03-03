@@ -54,15 +54,52 @@ class InfiniteDataLoader(dataloader.DataLoader):
         """
         self.iterator = self._get_iterator()
 
+class InfiniteUnlabeledDataLoader(dataloader.DataLoader):
+    """
+    专门针对无标签数据集的无限数据加载器
+    """
+    def __init__(self, *args, **kwargs):
+        """Dataloader that infinitely recycles workers, inherits from DataLoader."""
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "batch_sampler", _RepeatSampler(self.batch_sampler))
+        self.iterator = super().__iter__()
+
+    def __len__(self):
+        """Returns the length of the batch sampler's sampler."""
+        return len(self.batch_sampler.sampler)
+
+    def __iter__(self):
+        """Creates a sampler that repeats indefinitely."""
+        for _ in range(len(self)):
+            yield next(self.iterator)
+
+    def reset(self):
+        """
+        Reset iterator.
+        This is useful when we want to modify settings of dataset while training.
+        """
+        self.iterator = self._get_iterator()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class _RepeatSampler:
     """
     Sampler that repeats forever.
-
     Args:
         sampler (Dataset.sampler): The sampler to repeat.
     """
-
     def __init__(self, sampler):
         """Initializes an object that repeats a given sampler indefinitely."""
         self.sampler = sampler
@@ -71,7 +108,6 @@ class _RepeatSampler:
         """Iterates over the 'sampler' and yields its contents."""
         while True:
             yield from iter(self.sampler)
-
 
 def seed_worker(worker_id):  # noqa
     worker_seed = torch.initial_seed() % 2**32
@@ -95,7 +131,7 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
         data=data,
     )
 # 无标签数据集构建
-def build_unlabelyolo_dataset(cfg, unlabelimg_path, unlabelbatchsize=32,  mode="train", rect=False, stride=32):
+def build_unlabelyolo_dataset(cfg, unlabelimg_path, unlabelbatchsize=32, mode="train", rect=False, stride=32):
     return YOLOUnlabeledDataset(
         img_path=unlabelimg_path,
         imgsz=cfg.imgsz,
@@ -106,7 +142,6 @@ def build_unlabelyolo_dataset(cfg, unlabelimg_path, unlabelbatchsize=32,  mode="
         stride=int(stride),
         pad=0.0 if mode == "train" else 0.5,
         prefix=colorstr(f"{mode}: "),
-        
     )
 
 
@@ -132,13 +167,13 @@ def build_dataloader(dataset, batch, workers, shuffle=True):
 
 #无标签dataloader构建
 def build_unlabeleddataloader(unlabeldataset, batch, workers, shuffle=True):
-    """Return an InfiniteDataLoader or DataLoader for training or validation set."""
+    """Return an InfiniteUnlabeledDataLoader for unlabeled dataset."""
     batch = min(batch, len(unlabeldataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min(os.cpu_count() // max(nd, 1), workers)  # number of workers
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205)
-    return InfiniteDataLoader(
+    return InfiniteUnlabeledDataLoader(
         dataset=unlabeldataset,
         batch_size=batch,
         shuffle=shuffle,
@@ -149,6 +184,7 @@ def build_unlabeleddataloader(unlabeldataset, batch, workers, shuffle=True):
         worker_init_fn=seed_worker,
         generator=generator,
     )
+
 
 def check_source(source):
     """Check source type and return corresponding flag values."""

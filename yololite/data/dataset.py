@@ -344,7 +344,387 @@ class YOLODataset(Dataset):
 
 
 
+
 class YOLOUnlabeledDataset(Dataset):
+    """
+    无标签数据集类 - 用于无监督/自监督训练。
+    修改后返回强增强和弱增强两张图片
+    """
+    
+    def __init__(
+            self,
+            img_path,
+            imgsz=640,
+            augment=True,
+            hyp=None,
+            batch_size=16,
+            stride=32,
+            rect=False,
+            pad=0.5,
+            cache=False,
+            prefix="[Unlabeled] ",
+    ):
+        super().__init__()
+        
+        # 基础配置
+        self.img_path = img_path
+        self.imgsz = imgsz
+        self.augment = augment
+        self.hyp = hyp if hyp else DEFAULT_CFG
+        self.prefix = prefix
+        self.batch_size = batch_size
+        self.stride = stride
+        self.rect = rect
+        self.pad = pad
+        self.cache = cache
+        
+        # 获取图像文件
+        self.im_files = self._get_img_files(img_path)
+        self.ni = len(self.im_files)
+        assert self.ni > 0, f"{prefix}未找到任何图像文件"
+        
+        # 创建空标签结构（每条数据一个）
+        self.labels = self._create_empty_labels()
+        
+        # 矩形训练配置
+        if self.rect:
+            assert self.batch_size is not None
+            self._set_rectangle()
+        
+        # 图像缓存
+        self.buffer = []
+        self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
+        self.ims = [None] * self.ni
+        self.im_hw0 = [None] * self.ni
+        self.im_hw = [None] * self.ni
+        
+        # 构建强增强和弱增强变换
+        self.strong_transforms = self._build_strong_transforms()
+        self.weak_transforms = self._build_weak_transforms()
+        
+        LOGGER.info(f"{prefix}数据集初始化完成: {self.ni} 张图像, 增强={self.augment}")
+
+    def _get_img_files(self, img_path):
+        """获取图像文件列表。"""
+        f = []
+        for p in img_path if isinstance(img_path, list) else [img_path]:
+            p = Path(p)
+            if p.is_dir():
+                f += glob.glob(str(p / "**" / "*.*"), recursive=True)
+            elif p.is_file():
+                with open(p) as t:
+                    t = t.read().strip().splitlines()
+                    parent = str(p.parent) + os.sep
+                    f += [x.replace("./", parent) if x.startswith("./") else x for x in t]
+            else:
+                raise FileNotFoundError(f"{self.prefix}{p} 不存在")
+        
+        im_files = sorted(x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS)
+        return im_files
+
+    def _create_empty_labels(self):
+        """为每张图像创建空标签结构。"""
+        labels = []
+        for im_file in self.im_files:
+            # 获取图像形状
+            im = cv2.imread(im_file)
+            shape = im.shape[:2] if im is not None else (self.imgsz, self.imgsz)
+            
+            labels.append({
+                "im_file": im_file,
+                "shape": shape,
+                "cls": np.empty((0, 1)),      # 空类别
+                "bboxes": np.empty((0, 4)),   # 空边界框
+                "normalized": True,
+                "bbox_format": "xywh",
+            })
+        return labels
+
+    def _build_strong_transforms(self):
+        """构建强增强变换。"""
+        if self.augment:
+            self.hyp.mosaic = self.hyp.mosaic if not self.rect else 0.0
+            self.hyp.mixup = self.hyp.mixup if not self.rect else 0.0
+            transforms = v8_transforms(self, self.imgsz, self.hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                batch_idx=True,
+                bgr=self.hyp.bgr if self.augment else 0.0,
+            )
+        )
+        
+        return transforms
+
+    def _build_weak_transforms(self):
+        """构建弱增强变换。"""
+        from yololite.data.augment import weak_v8_transforms
+        return weak_v8_transforms(self, self.imgsz, self.hyp)
+
+    def _set_rectangle(self):
+        """设置矩形训练参数。"""
+        bi = np.floor(np.arange(self.ni) / self.batch_size).astype(int)
+        nb = bi[-1] + 1
+        
+        s = np.array([x["shape"] for x in self.labels])
+        ar = s[:, 0] / s[:, 1]
+        irect = ar.argsort()
+        
+        self.im_files = [self.im_files[i] for i in irect]
+        self.labels = [self.labels[i] for i in irect]
+        
+        shapes = [[1, 1]] * nb
+        for i in range(nb):
+            ari = ar[bi == i]
+            mini, maxi = ari.min(), ari.max()
+            if maxi < 1:
+                shapes[i] = [maxi, 1]
+            elif mini > 1:
+                shapes[i] = [1, 1 / mini]
+        
+        self.batch_shapes = np.ceil(np.array(shapes) * self.imgsz / self.stride + self.pad).astype(int) * self.stride
+        self.batch = bi
+
+    def load_image(self, i, rect_mode=True):
+        """加载图像。"""
+        im = self.ims[i]
+        
+        if im is None:
+            im = cv2.imread(self.im_files[i])
+            if im is None:
+                raise IOError(f"无法读取图像: {self.im_files[i]}")
+            
+            h0, w0 = im.shape[:2]
+            
+            if rect_mode and self.rect:
+                r = self.imgsz / max(h0, w0)
+                if r != 1:
+                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+            elif not (h0 == w0 == self.imgsz):
+                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+            
+            if self.augment:
+                self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]
+                self.buffer.append(i)
+                if len(self.buffer) > self.max_buffer_length:
+                    j = self.buffer.pop(0)
+                    self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+            
+            return im, (h0, w0), im.shape[:2]
+        
+        return self.ims[i], self.im_hw0[i], self.im_hw[i]
+
+    def get_image_and_label(self, index):
+        """获取图像和标签。"""
+        label = deepcopy(self.labels[index])
+        im, ori_shape, resized_shape = self.load_image(index)
+        
+        label["img"] = im
+        label["ori_shape"] = ori_shape
+        label["resized_shape"] = resized_shape
+        label["ratio_pad"] = (
+            resized_shape[0] / ori_shape[0],
+            resized_shape[1] / ori_shape[1],
+        )
+        
+        if self.rect:
+            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+        
+        return self._update_labels_info(label)
+
+    def _update_labels_info(self, label):
+        """更新标签格式。"""
+        bboxes = label.pop("bboxes", np.empty((0, 4)))
+        bbox_format = label.pop("bbox_format", "xywh")
+        normalized = label.pop("normalized", True)
+        
+        label["instances"] = Instances(bboxes, bbox_format=bbox_format, normalized=normalized)
+        
+        if "cls" not in label:
+            label["cls"] = np.empty((0, 1))
+        
+        return label
+
+    def __getitem__(self, index):
+        """获取单个样本，返回强增强和弱增强两个版本的图像。"""
+        # 获取原始图像和标签信息
+        base_label = self.get_image_and_label(index)
+        
+        # 对同一图像应用不同的增强方式
+        strong_label = deepcopy(base_label)
+        weak_label = deepcopy(base_label)
+        
+        # 应用强增强
+        strong_result = self.strong_transforms(strong_label)
+        # 应用弱增强  
+        weak_result = self.weak_transforms(weak_label)
+        
+        # 合并结果，包含强增强和弱增强的图像
+        result = {
+            'strong_img': strong_result['img'],
+            'weak_img': weak_result['img'],
+            'im_file': base_label['im_file'],
+            'batch_idx': strong_result.get('batch_idx', torch.tensor([0])),
+            'ori_shape': base_label['ori_shape'],
+            'resized_shape': base_label['resized_shape']
+        }
+        
+        return result
+
+    def __len__(self):
+        """返回数据集大小。"""
+        return len(self.labels)
+
+    def close_mosaic(self, hyp):
+        """训练后期关闭马赛克增强。"""
+        hyp.mosaic = 0.0
+        hyp.mixup = 0.0
+        self.strong_transforms = self._build_strong_transforms()
+        self.weak_transforms = self._build_weak_transforms()
+
+    @staticmethod
+    def collate_fn(batch):
+        """批次合并，处理强增强和弱增强图像。"""
+        new_batch = {}
+        
+        # 分离强增强和弱增强图像
+        strong_imgs = []
+        weak_imgs = []
+        batch_indices = []
+        im_files = []
+        ori_shapes = []
+        resized_shapes = []
+        
+        for item in batch:
+            strong_imgs.append(item['strong_img'])
+            weak_imgs.append(item['weak_img'])
+            batch_indices.append(item['batch_idx'])
+            im_files.append(item['im_file'])
+            ori_shapes.append(item['ori_shape'])
+            resized_shapes.append(item['resized_shape'])
+        
+        # 堆叠图像
+        new_batch['strong_img'] = torch.stack(strong_imgs, 0)
+        new_batch['weak_img'] = torch.stack(weak_imgs, 0)
+        
+        # 处理批次索引
+        new_batch['batch_idx'] = batch_indices
+        for i in range(len(new_batch['batch_idx'])):
+            new_batch['batch_idx'][i] += i
+        new_batch['batch_idx'] = torch.cat(new_batch['batch_idx'], 0)
+        
+        # 保留其他信息
+        new_batch['im_file'] = im_files
+        new_batch['ori_shape'] = ori_shapes
+        new_batch['resized_shape'] = resized_shapes
+        
+        return new_batch
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class YOLOUnlabeledDataset_old(Dataset):
     """
     无标签数据集类 - 用于无监督/自监督训练。
     
