@@ -323,8 +323,8 @@ class DetectionTrainer:
             temperature=1.0,
             #confidence_threshold_start=0.5,    # 前20轮用0.5，减少噪声
             #confidence_threshold_end=0.25,      # 后期降到0.25，增加召回
-            threshold_warmup_epochs=50,         # 50轮完成过渡
-            total_epochs=self.epochs,           # 175
+            #threshold_warmup_epochs=50,         # 50轮完成过渡
+          #  total_epochs=self.epochs,           # 175
             num_classes=num_classes,
             
         )
@@ -1322,7 +1322,7 @@ class DetectionTrainer:
                 f"{colorstr('blue', '║')} {colorstr('bold', f'Epoch {epoch + 1}/{self.epochs}')} 开始\n"
                 f"{colorstr('blue', '║')} 学习率：{self.optimizer.param_groups[0]['lr']:.6f}\n"
                 f"{colorstr('blue', '║')} 权重配置 -> 监督：{colorstr('green', f'{sup_weight:.4f}')}, 无监督：{colorstr('magenta', f'{unsup_weight:.4f}')}\n"
-                f"{colorstr('blue', '║')} 置信度阈值：{current_thr:.2f}\n"
+#                f"{colorstr('blue', '║')} 置信度阈值：{current_thr:.2f}\n"
                 f"{colorstr('blue', '║')} 计算策略：{colorstr('green', '启用无监督分支') if compute_unsupervised else colorstr('red', '仅监督模式 (权重过低或无数据)')}\n"
                 f"{colorstr('blue', '╚' + '═'*58 + '╝')}"
             )
@@ -1410,7 +1410,7 @@ class DetectionTrainer:
                         pseudo_label_count = unsup_dict.get("pseudo_labels", 0) if isinstance(unsup_dict, dict) else 0
                         
                         # 缩放
-                        unsupervise_loss = raw_unsup_loss * 0.1
+                        unsupervise_loss = raw_unsup_loss
                         
                         if not unsupervise_loss.dim() == 0:
                             unsupervise_loss = unsupervise_loss.sum()
