@@ -13,6 +13,41 @@ from yololite.utils.tal import TaskAlignedAssigner, dist2bbox,  make_anchors
 from .metrics import batch_probiou, bbox_iou, box_iou
 from .tal import bbox2dist
 
+#解决类别不平衡问题
+
+class VarifocalLoss(nn.Module):
+    """Varifocal loss by Zhang et al.
+
+    Implements the Varifocal Loss function for addressing class imbalance in object detection by focusing on
+    hard-to-classify examples and balancing positive/negative samples.
+
+    Attributes:
+        gamma (float): The focusing parameter that controls how much the loss focuses on hard-to-classify examples.
+        alpha (float): The balancing factor used to address class imbalance.
+
+    References:
+        https://arxiv.org/abs/2008.13367
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.75):
+        """Initialize the VarifocalLoss class with focusing and balancing parameters."""
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, pred_score: torch.Tensor, gt_score: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+        """Compute varifocal loss between predictions and ground truth."""
+        weight = self.alpha * pred_score.sigmoid().pow(self.gamma) * (1 - label) + gt_score * label
+        with torch.autocast(enabled=False):
+            loss = (
+                (F.binary_cross_entropy_with_logits(pred_score.float(), gt_score.float(), reduction="none") * weight)
+                .mean(1)
+                .sum()
+            )
+        return loss
+
+
+
 
 class DFLoss(nn.Module):
     """Criterion class for computing Distribution Focal Loss (DFL)."""

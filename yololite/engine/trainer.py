@@ -317,6 +317,16 @@ class DetectionTrainer:
         self.weight_transition_start_epoch = max(10, int(self.epochs * 0.2)) 
         self.weight_transition_end_epoch = self.epochs-5 # 结束过渡的epoch
         num_classes = self.data.get("nc", 80) 
+        #初始化一致性损失
+        self.consistent_loss = YOLO26ConsistencyLoss(
+        box_weight=1.0,
+        cls_weight=1.0,
+        obj_weight=0.5,
+        temperature=1.0,
+        confidence_threshold=0.25,
+        iou_type="ciou",
+        )
+        '''
         self.consistent_loss = YOLO26ConsistencyLoss(
             box_weight=1.0,
             cls_weight=1.0,
@@ -328,6 +338,8 @@ class DetectionTrainer:
             num_classes=num_classes,
             
         )
+        '''
+        
         # 设置学习率调度器
         self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False  # 提前停止
@@ -1420,7 +1432,7 @@ class DetectionTrainer:
                         epoch_total_unsup_loss += unsupervise_loss_val
                         
                         # [LOG] 每 N 个 batch 或第一个 batch 记录一次无监督细节
-                        if i == 0 or i % (nb // 5) == 0:
+                        if i == 0 or i % (nb // 3) == 0:
                              LOGGER.info(
                                 f"  [Batch {i}/{nb}] 无监督详情 -> "
                                 f"Loss: {unsupervise_loss_val:.4f}, "
@@ -1458,7 +1470,8 @@ class DetectionTrainer:
                     self.optimizer_step()
                     self.optimizer.zero_grad()
                     last_opt_step = ni
-
+                #临时进行测试
+                    #self.validator(mode="val")
                     if self.args.time:
                         self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
                         if self.stop:

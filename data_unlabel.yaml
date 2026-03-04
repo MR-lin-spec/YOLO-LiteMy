@@ -1,4 +1,4 @@
-path: /root/autodl-tmp/data
+path: /root/autodl-tmp/coco
 train: unlabel_image/images
 val: 
 is_unlabel: True

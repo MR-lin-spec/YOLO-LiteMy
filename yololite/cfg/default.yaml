@@ -31,7 +31,7 @@ close_mosaic: 20  # (int) 在最后的周期禁用马赛克增强（0 表示禁�
 resume: False  # (bool) 从最后的检查点恢复训练
 amp: False  # (bool) 自动混合精度（AMP）训练，选择项=[True, False]，True 表示运行 AMP 检查
 profile: False  # (bool) 在训练期间记录 ONNX 和 TensorRT 的速度以供日志使用
-freeze: 11  # (int | list, optional) 冻结前 n 层，或在训练期间冻结层索引列表 []
+freeze:   # (int | list, optional) 冻结前 n 层，或在训练期间冻结层索引列表 []
 multi_scale: False  # (bool) 是否在训练期间使用多尺度
 # 在 Train settings 区域添加以下参数
 cache: False  # (bool | str) 图像缓存到RAM(True/'ram')或磁盘('disk')加速数据加载
