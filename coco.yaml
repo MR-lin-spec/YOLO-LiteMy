@@ -1,5 +1,5 @@
 ath: /root/autodl-tmp/coco
-train: labeled_data/images
+train: images/train2017
 val: images/val2017
 nc: 80
 names:

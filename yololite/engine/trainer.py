@@ -307,14 +307,13 @@ class DetectionTrainer:
                    
                     batch = self.preprocess_batch(batch)  # 预处理批次
                     #计算无监督损失
-                    student_preds=self.model.forward(batch["img"]) # 模型前向传播得到学生模型的预测结果
+                    student_preds=self.model.forward(unlabelbatch["img"]) # 模型前向传播得到学生模型的预测结果
                     unsupervise_loss, unsupervise_loss_dict = self.consistent_loss(student_preds, teacher_preds)
                     #print("无监督损失：", unsupervise_loss)
                     #如果小于制定轮数，采用有监督，否则采用无监督
-                    if epoch<20:
-                        self.loss, self.loss_items = self.model(batch)  # 计算损失
-                    else:
-                        self.loss, self.loss_items=unsupervise_loss, unsupervise_loss_dict
+                   
+                    self.loss, self.loss_items = self.model(batch)  # 计算损失
+                    
                     #print("模型输出：", self.model(batch))
                    
                     self.tloss = (
