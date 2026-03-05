@@ -1,4 +1,4 @@
-ath: /root/autodl-tmp/coco
+path: /root/autodl-tmp/coco
 train: images/train2017
 val: images/val2017
 nc: 80

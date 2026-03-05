@@ -5,7 +5,7 @@ from yololite import YOLOLite
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端，必须在import pyplot之前
 # 加载预训练模型
-model = YOLOLite("yolo26l.pt")  # 加载预训练模型权重
+model = YOLOLite("yolo26m.pt")  # 加载预训练模型权重
   # 如果有这个属性会显示yaml路径
 
 # 不使用预训练模型，会导致损失难以下降
@@ -22,9 +22,9 @@ if __name__ == '__main__':
   results = model.train(
           data="data_labeled.yaml",               # 有标签数据集配置文件路径
           unlabeldata="data_unlabel.yaml", # 无标签数据集配置文件路径
-          epochs=2,                      # 训练周期数
+          epochs=10,                      # 训练周期数
           imgsz=640,                     # 输入图像尺寸
-          batch=16,                      # 批次大小
+          batch=8,                      # 批次大小
           device="cuda"                  # 指定训练设备
       )
 

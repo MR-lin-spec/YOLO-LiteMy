@@ -1,4 +1,4 @@
-ath: /root/autodl-tmp/coco
+path: /root/autodl-tmp/coco
 train: labeled_data/images
 val: images/val2017
 nc: 80
