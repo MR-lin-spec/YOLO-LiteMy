@@ -5,7 +5,7 @@ from yololite import YOLOLite
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端，必须在import pyplot之前
 # 加载预训练模型
-model = YOLOLite("yolo26l.pt")  # 加载预训练模型权重
+model = YOLOLite("/root/YOLO-LiteMy/yololite/cfg/yolo26.yaml")  # 加载预训练模型权重
   # 如果有这个属性会显示yaml路径
 
 # 不使用预训练模型，会导致损失难以下降
