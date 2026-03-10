@@ -232,6 +232,130 @@ class DetectionTrainer:
         # [新增] 初始化损失变化率跟踪器
         self.loss_tracker = LossRateTracker(window_size=10)
 
+
+        # ==== 新增：为绘制论文图1添加的数据记录组件 ====
+        self.optimization_logs = {
+            "parameters": [],      # 记录模型参数 w_t
+            "gradients": [],       # 记录真实梯度 g_t
+            "update_vectors": [],  # 记录优化器更新向量 u_t
+            "cosine_similarities": [],  # 记录方向对齐度
+            "loss_values": [],     # 记录损失值
+            "steps": []            # 记录训练步数
+        }
+        self.target_layer_name = None  # 要监控的层名称
+        self.log_interval = 10  # 记录间隔（每多少步记录一次）
+        # =============================================
+
+    def set_monitoring_layer(self, layer_name="model.model[-1].weight"):
+        """
+        设置要监控的模型层，用于记录参数和梯度
+        
+        参数:
+            layer_name (str): 模型层的名称，默认为最后一层的权重
+        """
+        self.target_layer_name = layer_name
+        LOGGER.info(f"设置监控层: {layer_name}")
+        
+    def _get_target_parameter(self):
+        """获取要监控的参数张量"""
+        if self.target_layer_name is None:
+            # 默认监控模型最后一层的权重参数
+            # 在YOLO中，model.model[-1] 是Detect层，我们需要获取其内部权重
+            try:
+                detect_layer = self.model.model[-1]
+                if hasattr(detect_layer, 'weight'):
+                    return detect_layer.weight
+                else:
+                    # 在YOLO的Detect层中，通常不直接有weight属性
+                    # 尝试获取Detect层的conv层的权重
+                    for name, module in detect_layer.named_modules():
+                        if hasattr(module, 'weight') and isinstance(module.weight, torch.Tensor):
+                            return module.weight
+            except Exception as e:
+                LOGGER.warning(f"自动查找参数失败: {e}")
+                return None
+        
+        # 根据layer_name获取参数
+        try:
+            if '.' in self.target_layer_name:
+                # 通过点分隔的路径获取
+                module_names = self.target_layer_name.split('.')
+                module = self.model
+                for name in module_names:
+                    if hasattr(module, name):
+                        module = getattr(module, name)
+                    elif name.isdigit():
+                        module = module[int(name)]
+                    elif name.startswith('[') and name.endswith(']'):
+                        idx = int(name[1:-1])
+                        module = module[idx]
+                if hasattr(module, 'weight'):
+                    return module.weight
+                else:
+                    LOGGER.warning(f"模块 {self.target_layer_name} 没有weight属性")
+                    return None
+            else:
+                # 直接名称查找
+                for name, param in self.model.named_parameters():
+                    if self.target_layer_name in name:
+                        return param
+                LOGGER.warning(f"未找到包含 {self.target_layer_name} 的参数")
+                return None
+        except Exception as e:
+            LOGGER.warning(f"获取参数 {self.target_layer_name} 失败: {e}")
+            return None
+    
+    def find_target_parameter(self, target_type="detect", target_index=-1):
+        """
+        智能查找目标参数
+        
+        参数:
+            target_type: 目标层类型，可选值: "detect", "conv", "head", "classifier"
+            target_index: 层索引，-1表示最后一层
+            
+        返回:
+            torch.nn.Parameter: 目标参数
+        """
+        all_params = list(self.model.named_parameters())
+        
+        if not all_params:
+            LOGGER.warning("模型没有可训练参数")
+            return None
+        
+        # 打印参数列表用于调试
+        LOGGER.info(f"模型共有 {len(all_params)} 个参数组")
+        
+        if target_type == "detect":
+            # 查找Detect层的参数
+            for name, param in all_params:
+                if "detect" in name.lower() or "head" in name.lower():
+                    LOGGER.info(f"找到Detect层参数: {name}, shape: {param.shape}")
+                    return param
+        
+        elif target_type == "conv":
+            # 查找卷积层的权重
+            for name, param in all_params:
+                if "conv" in name.lower() and "weight" in name.lower():
+                    LOGGER.info(f"找到卷积层参数: {name}, shape: {param.shape}")
+                    return param
+        
+        elif target_type == "last":
+            # 返回最后一个参数
+            last_name, last_param = all_params[-1]
+            LOGGER.info(f"使用最后一个参数: {last_name}, shape: {last_param.shape}")
+            return last_param
+        
+        # 默认返回第一个权重参数
+        for name, param in all_params:
+            if "weight" in name and len(param.shape) >= 2:
+                LOGGER.info(f"使用权重参数: {name}, shape: {param.shape}")
+                return param
+        
+        # 如果都没找到，返回第一个参数
+        first_name, first_param = all_params[0]
+        LOGGER.info(f"使用第一个参数: {first_name}, shape: {first_param.shape}")
+        return first_param
+        
     def _setup_scheduler(self):
         """初始化训练学习率调度器。"""
         if self.args.cos_lr:
@@ -362,6 +486,506 @@ class DetectionTrainer:
         # 双重检查满足条件 2: sup > unsup
         assert sup_weight > unsup_weight, f"权重配置错误：sup({sup_weight:.4f}) 必须大于 unsup({unsup_weight:.4f})"
         return sup_weight, unsup_weight
+    
+    def _get_optimizer_update_vector(self, param, optimizer):
+        """
+        从优化器状态中提取更新向量 u_t
+        
+        支持的优化器类型：
+        1. Adam系列: u_t = m_hat / (sqrt(v_hat) + eps)
+        2. SGD: u_t = momentum_buffer
+        3. MuSGD: 计算 Muon更新向量
+        4. Muon: 计算 Muon更新向量
+        """
+        if param not in optimizer.state:
+            return None
+            
+        state = optimizer.state[param]
+        
+        # 获取优化器类型
+        optimizer_type = type(optimizer).__name__
+        
+        if optimizer_type in ['Adam', 'AdamW']:
+            # Adam系列优化器
+            if 'exp_avg' in state and 'exp_avg_sq' in state:
+                m = state['exp_avg']  # 一阶矩估计
+                v = state['exp_avg_sq']  # 二阶矩估计
+                step = state.get('step', 1)
+                
+                # 获取优化器超参数
+                for group in optimizer.param_groups:
+                    beta1, beta2 = group.get('betas', (0.9, 0.999))
+                    eps = group.get('eps', 1e-8)
+                    break
+                
+                # 偏差校正
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
+                
+                m_hat = m / bias_correction1
+                v_hat = v / bias_correction2
+                
+                # Adam的更新向量
+                u_t = m_hat / (v_hat.sqrt() + eps)
+                return u_t.clone().detach().cpu().numpy().flatten()
+        
+        elif optimizer_type == 'SGD':
+            # SGD优化器
+            if 'momentum_buffer' in state:
+                return state['momentum_buffer'].clone().detach().cpu().numpy().flatten()
+        
+        elif optimizer_type == 'MuSGD':
+            # MuSGD优化器 - 返回混合更新向量
+            # MuSGD有两种更新：Muon更新和SGD更新
+            update_vectors = []
+            
+            # 1. 获取Muon更新向量
+            if 'momentum_buffer' in state:  # 这是Muon的动量缓冲区
+                grad = param.grad
+                if grad is not None:
+                    # 使用与muon_update函数相同的逻辑计算Muon更新
+                    momentum = state['momentum_buffer']
+                    
+                    # 获取优化器超参数
+                    for group in optimizer.param_groups:
+                        beta = group.get('momentum', 0.95)
+                        nesterov = group.get('nesterov', True)
+                        use_muon = group.get('use_muon', False)
+                        
+                        if use_muon:
+                            # 模拟muon_update的逻辑
+                            momentum_copy = momentum.clone()
+                            update_muon = grad.lerp(momentum_copy, beta) if nesterov else momentum_copy
+                            
+                            # 模拟正交化（简化为仅返回正交化后的更新）
+                            # 注意：这里简化处理，实际正交化在muon_update函数中完成
+                            update_vectors.append(update_muon.clone().detach().cpu().numpy().flatten())
+                        break
+            
+            # 2. 获取SGD更新向量
+            if 'momentum_buffer_SGD' in state:  # 这是SGD的动量缓冲区
+                sgd_update = state['momentum_buffer_SGD'].clone().detach().cpu().numpy().flatten()
+                update_vectors.append(sgd_update)
+            
+            # 返回第一个更新向量（或所有向量的组合）
+            if update_vectors:
+                # 可以返回所有更新向量的平均值或其他组合
+                return update_vectors[0]  # 暂时返回第一个（Muon更新）
+        
+        elif optimizer_type == 'Muon':
+            # Muon优化器
+            if 'momentum_buffer' in state:
+                grad = param.grad
+                if grad is not None:
+                    momentum = state['momentum_buffer']
+                    
+                    # 获取优化器超参数
+                    for group in optimizer.param_groups:
+                        beta = group.get('momentum', 0.95)
+                        # 简化计算，返回动量更新
+                        update = grad.lerp(momentum, beta)  # 类似于Nesterov
+                        return update.clone().detach().cpu().numpy().flatten()
+        
+        return None
+
+    def _log_optimization_internals(self, target_param, optimizer, step, loss=None):
+        """
+        记录优化器内部状态的详细日志
+        
+        参数:
+            target_param: 要监控的目标参数
+            optimizer: 优化器对象
+            step: 当前训练步数
+            loss: 损失值，可以为None
+        """
+        if target_param is None or step % self.log_interval != 0:
+            return
+            
+        optimizer_type = type(optimizer).__name__
+        self.optimization_logs.setdefault("optimizer_type", optimizer_type)
+        
+        # 安全地处理损失值
+        if loss is not None:
+            try:
+                loss_value = float(loss)
+                self.optimization_logs.setdefault("loss_values", []).append(loss_value)
+            except (TypeError, ValueError):
+                # 如果无法转换为float，跳过损失记录
+                pass
+        
+        # 记录当前参数 w_t
+        try:
+            w_t = target_param.data.clone().detach().cpu().numpy().flatten()
+            self.optimization_logs.setdefault("parameters", []).append(w_t.copy())
+            self.optimization_logs.setdefault("steps", []).append(step)
+        except Exception as e:
+            LOGGER.warning(f"记录参数时出错: {e}")
+            return
+        
+        # 记录真实梯度 g_t
+        if target_param.grad is not None:
+            try:
+                g_t = target_param.grad.clone().detach().cpu().numpy().flatten()
+                self.optimization_logs.setdefault("gradients", []).append(g_t.copy())
+                
+                # 根据优化器类型记录不同的更新向量
+                if optimizer_type == 'MuSGD':
+                    # MuSGD有混合更新，记录两种更新向量
+                    self._log_musgd_updates(target_param, optimizer, g_t, step)
+                else:
+                    # 其他优化器
+                    u_t = self._get_optimizer_update_vector(target_param, optimizer)
+                    if u_t is not None:
+                        self.optimization_logs.setdefault("update_vectors", []).append(u_t.copy())
+                        
+                        # 计算方向对齐度
+                        cos_sim = self._compute_cosine_similarity(g_t, u_t)
+                        self.optimization_logs.setdefault("cosine_similarities", []).append(cos_sim)
+                
+                # 记录学习率
+                for group in optimizer.param_groups:
+                    self.optimization_logs.setdefault("learning_rates", []).append(group.get('lr', 0))
+                    break
+                    
+            except Exception as e:
+                LOGGER.warning(f"记录梯度和更新向量时出错: {e}")
+    
+    def _log_musgd_updates(self, target_param, optimizer, g_t, step):
+        """
+        专门记录MuSGD优化器的更新向量
+        """
+        if target_param not in optimizer.state:
+            return
+            
+        state = optimizer.state[target_param]
+        musgd_updates = {}
+        
+        # 获取当前参数组设置
+        for group in optimizer.param_groups:
+            if target_param in group['params']:
+                use_muon = group.get('use_muon', False)
+                muon_weight = getattr(optimizer, 'muon', 0.5)
+                sgd_weight = getattr(optimizer, 'sgd', 0.5)
+                break
+        else:
+            return
+        
+        # 1. 记录Muon更新向量
+        if 'momentum_buffer' in state and use_muon:
+            momentum_muon = state['momentum_buffer']
+            
+            # 计算Muon更新（简化版本，不包括正交化）
+            for group in optimizer.param_groups:
+                if target_param in group['params']:
+                    beta = group.get('momentum', 0.95)
+                    nesterov = group.get('nesterov', False)
+                    
+                    if nesterov:
+                        update_muon = g_t.lerp(momentum_muon, beta) if hasattr(g_t, 'lerp') else beta * momentum_muon + (1 - beta) * target_param.grad
+                    else:
+                        update_muon = momentum_muon
+                    
+                    musgd_updates['muon_update'] = update_muon.clone().detach().cpu().numpy().flatten()
+                    break
+        
+        # 2. 记录SGD更新向量
+        if 'momentum_buffer_SGD' in state and use_muon:
+            momentum_sgd = state['momentum_buffer_SGD']
+            musgd_updates['sgd_update'] = momentum_sgd.clone().detach().cpu().numpy().flatten()
+        
+        # 3. 记录最终组合更新
+        if 'muon_update' in musgd_updates and 'sgd_update' in musgd_updates:
+            # 根据权重组合更新向量
+            update_combined = (muon_weight * musgd_updates['muon_update'] + 
+                             sgd_weight * musgd_updates['sgd_update'])
+            self.optimization_logs["update_vectors"].append(update_combined)
+            
+            # 计算方向对齐度
+            cos_sim = self._compute_cosine_similarity(g_t, update_combined)
+            self.optimization_logs["cosine_similarities"].append(cos_sim)
+            
+            # 分别记录Muon和SGD的更新
+            self.optimization_logs.setdefault("muon_updates", []).append(musgd_updates.get('muon_update'))
+            self.optimization_logs.setdefault("sgd_updates", []).append(musgd_updates.get('sgd_update'))
+            
+        elif 'muon_update' in musgd_updates:
+            # 只有Muon更新
+            self.optimization_logs["update_vectors"].append(musgd_updates['muon_update'])
+            
+            cos_sim = self._compute_cosine_similarity(g_t, musgd_updates['muon_update'])
+            self.optimization_logs["cosine_similarities"].append(cos_sim)
+            self.optimization_logs.setdefault("muon_updates", []).append(musgd_updates['muon_update'])
+            
+        elif 'sgd_update' in musgd_updates:
+            # 只有SGD更新
+            self.optimization_logs["update_vectors"].append(musgd_updates['sgd_update'])
+            
+            cos_sim = self._compute_cosine_similarity(g_t, musgd_updates['sgd_update'])
+            self.optimization_logs["cosine_similarities"].append(cos_sim)
+            self.optimization_logs.setdefault("sgd_updates", []).append(musgd_updates['sgd_update'])
+    
+    def plot_optimization_curves(self):
+        """
+        绘制优化曲线并将详细数据保存到 TXT 文件。
+        所有标签均为英文，数据已对齐。
+        """
+        if not self.optimization_logs.get("steps"):
+            LOGGER.warning("No optimization logs found. Skipping plotting and saving.")
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            
+            # 字体设置 (纯英文环境兼容)
+            plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica', 'sans-serif']
+            plt.rcParams['axes.unicode_minus'] = False
+
+            # 提取原始数据
+            steps = self.optimization_logs.get("steps", [])
+            losses = self.optimization_logs.get("loss_values", [])
+            cos_sims = self.optimization_logs.get("cosine_similarities", [])
+            param_norms_data = self.optimization_logs.get("parameters", [])
+            muon_updates = self.optimization_logs.get("muon_updates", [])
+            sgd_updates = self.optimization_logs.get("sgd_updates", [])
+
+            if len(steps) == 0:
+                return
+
+            # === 数据对齐策略 ===
+            lists_to_check = [steps]
+            if losses: lists_to_check.append(losses)
+            if cos_sims: lists_to_check.append(cos_sims)
+            if param_norms_data: lists_to_check.append(param_norms_data)
+            if muon_updates: lists_to_check.append(muon_updates)
+            if sgd_updates: lists_to_check.append(sgd_updates)
+
+            min_len = min(len(lst) for lst in lists_to_check)
+            
+            if min_len < 2:
+                LOGGER.warning(f"Not enough data points (min_len={min_len}). Skipping.")
+                return
+
+            # 截断数据
+            steps = steps[:min_len]
+            losses = losses[:min_len] if losses else []
+            cos_sims = cos_sims[:min_len] if cos_sims else []
+            param_norms_data = param_norms_data[:min_len] if param_norms_data else []
+            muon_updates = muon_updates[:min_len] if muon_updates else []
+            sgd_updates = sgd_updates[:min_len] if sgd_updates else []
+
+            # 计算派生数据 (范数)
+            param_norms = [np.linalg.norm(p) for p in param_norms_data] if param_norms_data else []
+            muon_norms = [np.linalg.norm(u) for u in muon_updates] if muon_updates else []
+            sgd_norms = [np.linalg.norm(u) for u in sgd_updates] if sgd_updates else []
+
+            LOGGER.info(f"Optimization data aligned to {min_len} points for plotting and saving.")
+
+            # === 1. 绘图部分 ===
+            optimizer_type = self.optimization_logs.get("optimizer_type", "Unknown")
+            is_musgd = optimizer_type == "MuSGD" and muon_norms and sgd_norms
+            
+            fig_rows = 3 if not is_musgd else 4
+            fig, axes = plt.subplots(fig_rows, 1, figsize=(14, 3 * fig_rows))
+            fig.suptitle(f'Optimization Dynamics Analysis ({optimizer_type})', fontsize=16, fontweight='bold')
+
+            # Plot 1: Loss
+            ax0 = axes[0] if fig_rows > 1 else axes
+            if losses:
+                ax0.plot(steps, losses, label='Training Loss', color='blue', linewidth=1.5)
+                ax0.set_xlabel('Optimization Steps')
+                ax0.set_ylabel('Loss Value')
+                ax0.set_title('Training Loss Convergence')
+                ax0.grid(True, linestyle='--', alpha=0.6)
+                ax0.legend()
+            
+            # Plot 2: Cosine Similarity
+            ax1 = axes[1] if fig_rows > 1 else axes
+            if len(axes) > 1:
+                ax1 = axes[1]
+                if cos_sims:
+                    ax1.plot(steps, cos_sims, label='Cosine Similarity (g, u)', color='green', linewidth=1.5)
+                    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+                    ax1.axhline(y=1.0, color='red', linestyle='--', linewidth=0.8, label='Perfect Alignment')
+                    ax1.set_xlabel('Optimization Steps')
+                    ax1.set_ylabel('Cosine Similarity')
+                    ax1.set_title('Gradient-Update Direction Alignment')
+                    ax1.set_ylim(-1.1, 1.1)
+                    ax1.grid(True, linestyle='--', alpha=0.6)
+                    ax1.legend()
+
+            # Plot 3: Parameter Norm
+            ax2 = axes[2] if fig_rows > 2 else axes
+            if len(axes) > 2:
+                ax2 = axes[2]
+                if param_norms:
+                    ax2.plot(steps, param_norms, label='Parameter Norm (||w||)', color='purple', linewidth=1.5)
+                    ax2.set_xlabel('Optimization Steps')
+                    ax2.set_ylabel('L2 Norm')
+                    ax2.set_title('Parameter Norm Evolution')
+                    ax2.grid(True, linestyle='--', alpha=0.6)
+                    ax2.legend()
+
+            # Plot 4: MuSGD Comparison (Optional)
+            if is_musgd and len(axes) > 3:
+                ax3 = axes[3]
+                ax3.plot(steps, muon_norms, label='Muon Update Norm', color='orange', linewidth=1.5)
+                ax3.plot(steps, sgd_norms, label='SGD Update Norm', color='cyan', linewidth=1.5, linestyle='--')
+                ax3.set_xlabel('Optimization Steps')
+                ax3.set_ylabel('Update Vector Norm')
+                ax3.set_title('MuSGD Component Analysis')
+                ax3.grid(True, linestyle='--', alpha=0.6)
+                ax3.legend()
+
+            plt.tight_layout()
+            save_path_img = self.save_dir / f"optimization_curves_{optimizer_type}.png"
+            plt.savefig(save_path_img, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            LOGGER.info(f"Optimization curves saved to {save_path_img}")
+
+            # === 2. 保存 TXT 文件部分 ===
+            self.save_optimization_logs_to_txt(
+                steps=steps,
+                losses=losses,
+                cos_sims=cos_sims,
+                param_norms=param_norms,
+                muon_norms=muon_norms if is_musgd else None,
+                sgd_norms=sgd_norms if is_musgd else None,
+                optimizer_type=optimizer_type
+            )
+
+        except Exception as e:
+            LOGGER.error(f"Failed to plot/save optimization curves: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def save_optimization_logs_to_txt(self, steps, losses, cos_sims, param_norms, muon_norms=None, sgd_norms=None, optimizer_type="Unknown"):
+        """
+        将优化日志数据保存为结构化的 TXT 文件，方便后续提取分析。
+        """
+        if not steps:
+            return
+
+        save_path = self.save_dir / f"optimization_logs_{optimizer_type}.txt"
+        
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                # 写入头部信息
+                f.write("=" * 80 + "\n")
+                f.write(f"OPTIMIZATION LOGS SUMMARY\n")
+                f.write(f"Optimizer Type: {optimizer_type}\n")
+                f.write(f"Total Recorded Steps: {len(steps)}\n")
+                f.write(f"Save Directory: {self.save_dir}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                # 定义列头
+                headers = ["Step", "Loss"]
+                data_cols = [steps, losses]
+                
+                if cos_sims:
+                    headers.append("Cosine_Similarity")
+                    data_cols.append(cos_sims)
+                
+                if param_norms:
+                    headers.append("Param_Norm_L2")
+                    data_cols.append(param_norms)
+                
+                if muon_norms:
+                    headers.append("Muon_Update_Norm")
+                    data_cols.append(muon_norms)
+                
+                if sgd_norms:
+                    headers.append("SGD_Update_Norm")
+                    data_cols.append(sgd_norms)
+                
+                # 写入表头
+                f.write("\t".join(headers) + "\n")
+                f.write("-" * 80 + "\n")
+                
+                # 写入数据行
+                num_rows = len(steps)
+                for i in range(num_rows):
+                    row_data = []
+                    for col in data_cols:
+                        val = col[i] if i < len(col) else ""
+                        # 格式化数值
+                        if isinstance(val, float):
+                            row_data.append(f"{val:.6f}")
+                        else:
+                            row_data.append(str(val))
+                    f.write("\t".join(row_data) + "\n")
+                
+                # 写入统计摘要
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("STATISTICAL SUMMARY\n")
+                f.write("=" * 80 + "\n")
+                
+                if cos_sims:
+                    avg_cos = sum(cos_sims) / len(cos_sims)
+                    min_cos = min(cos_sims)
+                    max_cos = max(cos_sims)
+                    f.write(f"Cosine Similarity - Avg: {avg_cos:.4f}, Min: {min_cos:.4f}, Max: {max_cos:.4f}\n")
+                
+                if param_norms:
+                    avg_pn = sum(param_norms) / len(param_norms)
+                    f.write(f"Parameter Norm - Avg: {avg_pn:.4f}, Final: {param_norms[-1]:.4f}\n")
+                
+                if muon_norms and sgd_norms:
+                    ratio_avg = sum(m/s if s!=0 else 0 for m,s in zip(muon_norms, sgd_norms)) / len(muon_norms)
+                    f.write(f"Muon/SGD Norm Ratio (Avg): {ratio_avg:.4f}\n")
+                    
+                f.write("=" * 80 + "\n")
+                
+            LOGGER.info(f"Optimization logs saved to TXT: {save_path}")
+            
+        except Exception as e:
+            LOGGER.error(f"Failed to save optimization logs to TXT: {e}")
+    
+    def get_optimization_summary(self):
+        """获取优化记录的统计摘要"""
+        if not self.optimization_logs.get("steps"):
+            return {}
+        
+        summary = {
+            "total_steps": len(self.optimization_logs["steps"]),
+            "optimizer_type": self.optimization_logs.get("optimizer_type", "Unknown"),
+        }
+        
+        if self.optimization_logs.get("cosine_similarities"):
+            cos_sims = self.optimization_logs["cosine_similarities"]
+            summary.update({
+                "avg_cosine_similarity": float(np.mean(cos_sims)),
+                "std_cosine_similarity": float(np.std(cos_sims)),
+                "min_cosine_similarity": float(np.min(cos_sims)),
+                "max_cosine_similarity": float(np.max(cos_sims)),
+                "positive_alignment_ratio": float(np.sum(np.array(cos_sims) > 0) / len(cos_sims)),
+                "perfect_alignment_ratio": float(np.sum(np.abs(np.array(cos_sims) - 1.0) < 0.01) / len(cos_sims)),
+            })
+        
+        # MuSGD特定统计
+        if summary["optimizer_type"] == "MuSGD":
+            if "muon_updates" in self.optimization_logs and "sgd_updates" in self.optimization_logs:
+                muon_norms = []
+                sgd_norms = []
+                
+                for muon_update, sgd_update in zip(self.optimization_logs["muon_updates"], 
+                                                  self.optimization_logs["sgd_updates"]):
+                    if muon_update is not None:
+                        muon_norms.append(np.linalg.norm(muon_update))
+                    if sgd_update is not None:
+                        sgd_norms.append(np.linalg.norm(sgd_update))
+                
+                if muon_norms and sgd_norms:
+                    summary.update({
+                        "avg_muon_norm": float(np.mean(muon_norms)),
+                        "avg_sgd_norm": float(np.mean(sgd_norms)),
+                        "muon_sgd_norm_ratio": float(np.mean(np.array(muon_norms) / (np.array(sgd_norms) + 1e-8))),
+                    })
+        
+        LOGGER.info(f"优化记录摘要: {summary}")
+        return summary
+
+
 
     def _setup_train(self):
         """构建数据加载器和优化器。"""
@@ -394,8 +1018,8 @@ class DetectionTrainer:
         self.amp = torch.tensor(self.args.amp).to(self.device)  # 是否启用 AMP
         if self.amp:  # 单 GPU
             self.model = self.model.to(self.device)  # 移动模型到指定设备
-            self.amp = bool(self.amp)  # 转为布尔值
-            self.scaler = (
+        self.amp = bool(self.amp)  # 转为布尔值
+        self.scaler = (
                 torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
             )
         # 检查图像大小
@@ -442,13 +1066,13 @@ class DetectionTrainer:
         # 权重过渡策略参数 (虽然新方法不用，但保留以防旧方法被调用)
         self.weight_transition_start_epoch = max(10, int(self.epochs * 0.2)) 
         self.weight_transition_end_epoch = self.epochs-5  # 结束过渡的 epoch
-        num_classes = self.data.get("nc", 80) 
-        #初始化一致性损失
-        self.consistent_loss = YOLO26ConsistencyLoss(
+        num_class = self.data.get("nc", 80) 
+        #初始化一致性损失（GMM版本）
+        self.consistent_loss =YOLO26ConsistencyLoss(
             box_weight=1.0,
             cls_weight=1.0,
-            temperature=1.0,
-            num_classes=num_classes,
+            temperature=1.5,
+            num_classes=num_class
         )
         # [新增] 重置损失跟踪器
         self.loss_tracker.reset()
@@ -459,6 +1083,78 @@ class DetectionTrainer:
         self.resume_training(ckpt)  # 恢复训练
         self.scheduler.last_epoch = self.start_epoch - 1  # 不移动
 
+    def _safe_get_loss(self):
+        """
+        安全地获取损失值，处理各种可能的损失存储方式
+        
+        返回:
+            float or None: 损失值，如果无法获取则返回None
+        """
+        try:
+            # 尝试从 self.loss 获取
+            if hasattr(self, 'loss') and self.loss is not None:
+                # 确保可以转换为float
+                loss_value = self.loss
+                if isinstance(loss_value, torch.Tensor):
+                    return float(loss_value.detach().cpu().item())
+                elif isinstance(loss_value, (int, float)):
+                    return float(loss_value)
+            
+            # 尝试从 self.loss_items 获取
+            if hasattr(self, 'loss_items'):
+                if isinstance(self.loss_items, (list, tuple)) and len(self.loss_items) > 0:
+                    first_loss = self.loss_items[0]
+                    if isinstance(first_loss, torch.Tensor):
+                        return float(first_loss.detach().cpu().item())
+                    elif isinstance(first_loss, (int, float)):
+                        return float(first_loss)
+            
+            # 尝试从 self.total_loss 获取
+            if hasattr(self, 'total_loss') and self.total_loss is not None:
+                if isinstance(self.total_loss, torch.Tensor):
+                    return float(self.total_loss.detach().cpu().item())
+                elif isinstance(self.total_loss, (int, float)):
+                    return float(self.total_loss)
+            
+        except Exception as e:
+            LOGGER.debug(f"获取损失值失败: {e}")
+        
+        return None
+    def _compute_cosine_similarity(self, vec1, vec2):
+        """
+        计算两个向量之间的余弦相似度
+        
+        参数:
+            vec1 (np.ndarray): 第一个向量 (通常是梯度)
+            vec2 (np.ndarray): 第二个向量 (通常是更新向量)
+            
+        返回:
+            float: 余弦相似度值 [-1, 1]
+        """
+        try:
+            # 确保是一维数组
+            v1 = vec1.flatten()
+            v2 = vec2.flatten()
+            
+            # 计算点积
+            dot_product = np.dot(v1, v2)
+            
+            # 计算范数
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+            
+            # 防止除以零
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+                
+            cosine_sim = dot_product / (norm1 * norm2)
+            
+            # 限制范围在 [-1, 1] 之间，防止浮点数误差
+            return float(np.clip(cosine_sim, -1.0, 1.0))
+            
+        except Exception as e:
+            LOGGER.warning(f"计算余弦相似度失败: {e}")
+            return 0.0
     def train(self):
         """
         详细日志版训练循环：
@@ -475,6 +1171,7 @@ class DetectionTrainer:
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
         has_unlabel = self.unlabelloader is not None
+        unlabel_iter = iter(self.unlabelloader) if has_unlabel else None
         
         # [LOG] 训练启动概览
         LOGGER.info(
@@ -503,14 +1200,16 @@ class DetectionTrainer:
                 self.scheduler.step()  #更新学习率
             
             # [修改] 调用动态权重的方法
-            sup_weight, unsup_weight =self.get_linear_static_weights(epoch)  # 使用线性静态权重方法
+            sup_weight, unsup_weight =self.get_linear_static_weights(epoch)  # 使用静态权重方法
+            #sup_weight, unsup_weight =0.6,0.4  # 使用线性静态权重方法
+
             
             # 获取一致性损失的阈值（如果有）
             current_thr = 0.25
             if hasattr(self, 'consistent_loss') and hasattr(self.consistent_loss, 'set_epoch'):
                 current_thr = self.consistent_loss.set_epoch(epoch)
             
-            unlabel_iter = iter(self.unlabelloader) if has_unlabel else None
+           # unlabel_iter = iter(self.unlabelloader) if has_unlabel else None
             # 严格判断是否需要计算无监督分支
             compute_unsupervised = (unsup_weight > 1e-6) and has_unlabel and (epoch >= MIN_EPOCH_FOR_UNSUP_FORWARD)
             
@@ -546,10 +1245,31 @@ class DetectionTrainer:
                 f"{colorstr('blue', '║')} 计算策略：{colorstr('green', '启用无监督分支') if compute_unsupervised else colorstr('red', '仅监督模式 (权重过低或无数据)')}\n"
                 f"{colorstr('blue', '╚' + '═'*58 + '╝')}",
             )
+            # 方法1：自动查找合适的参数
+            self.target_param = self.find_target_parameter("last")
             
+            # 方法2：或者手动指定（根据您的YOLO结构）
+            # 从模型结构看，第22层可能是合适的监控点
+            # self.target_param = self.model.model[22].weight  # 修改为实际存在的层
+            
+            if self.target_param is None:
+                LOGGER.warning("未找到合适的监控参数，将跳过优化器记录")
+                self.target_param = None
+            else:
+                LOGGER.info(f"监控参数: {self.target_param.shape}")
+                # 确保梯度会被计算
+                self.target_param.requires_grad_(True)
+                self.target_param.retain_grad()
             for i, batch in pbar:
                 ni = i + nb * epoch
-                
+               # ==== 修改：使用已找到的参数 ====
+                if self.target_param is not None and ni % self.log_interval == 0:
+                    try:
+                        w_t = self.target_param.data.clone().detach().cpu().numpy().flatten()
+                        self.optimization_logs.setdefault("parameters", []).append(w_t.copy())
+                        self.optimization_logs.setdefault("steps", []).append(ni)
+                    except Exception as e:
+                        LOGGER.debug(f"记录参数失败: {e}")
                 # 热身逻辑
                 if ni <= nw:
                     xi = [0, nw]
@@ -574,10 +1294,17 @@ class DetectionTrainer:
                 # 前向传播
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    
+                     # ==== 新增：在反向传播前记录梯度 ====
+                    if self.target_param is not None and ni % self.log_interval == 0 and self.target_param.grad is None:
+                    # 确保梯度存在
+                        self.target_param.retain_grad()
                     # --- 1. 监督损失 ---
                     self.loss, self.loss_items = self.model(batch)
-                    sup_loss_val = self.loss.item() if torch.is_tensor(self.loss) else self.loss
+                    # 修复：确保转换为标量
+                    if torch.is_tensor(self.loss):
+                        sup_loss_val = float(self.loss.sum()) # sum() 处理多元素情况，float() 转换为 Python 浮点数
+                    else:
+                        sup_loss_val = float(self.loss)
                     if not isinstance(sup_loss_val, float):
                         sup_loss_val = float(sup_loss_val)
                     
@@ -606,19 +1333,20 @@ class DetectionTrainer:
                         pseudo_label_count = unsup_dict.get("pseudo_labels", 0) if isinstance(unsup_dict, dict) else 0
                         
                         # 缩放 (保持与原代码一致，如有需要可调整)
-                        unsupervise_loss = raw_unsup_loss
+                        unsupervise_loss = raw_unsup_loss*0.1
                         if not unsupervise_loss.dim() == 0:
                             unsupervise_loss = unsupervise_loss.sum()
                         
-                        if not self.loss.dim() == 0:
-                            self.loss = self.loss.sum()
-                            
                         unsupervise_loss_val = unsupervise_loss.item()
                         epoch_unsup_count += 1
                         epoch_total_unsup_loss += unsupervise_loss_val
-                    
+                    if not self.loss.dim() == 0:
+                        self.loss = self.loss.sum()
+
                     epoch_total_sup_loss += sup_loss_val
-                    
+                    # ==== 新增：记录损失值 ====
+                    if ni % self.log_interval == 0:
+                        self.optimization_logs["loss_values"].append(float(self.loss))
                     # --- 3. 总损失合并 ---
                     sup_loss_contrib = sup_loss_val * sup_weight
                     unsup_loss_contrib = unsupervise_loss_val * unsup_weight
@@ -649,6 +1377,17 @@ class DetectionTrainer:
                     
                     # 反向传播
                     self.scaler.scale(self.total_loss).backward()
+
+
+                   # ==== 修改：记录优化器状态 ====
+                if self.target_param is not None and ni % self.log_interval == 0:
+                    # 安全地获取损失值
+                    current_loss = self._safe_get_loss()
+                    
+                    # 调用记录函数
+                    self._log_optimization_internals(self.target_param, self.optimizer, ni, current_loss)
+
+
                     self.ema.update(self.model)  # EMA 更新
                     
                     # 优化步骤
@@ -662,6 +1401,21 @@ class DetectionTrainer:
                             LOGGER.info(f"\n{colorstr('yellow', '达到限时训练时间，停止训练。')}")
                             break
                     
+
+                    if self.optimization_logs["steps"]:
+                        summary = self.get_optimization_summary()
+                        
+                        LOGGER.info(
+                            f"\n{colorstr('bold', '优化记录统计:')}\n"
+                            f"  总记录步数: {summary.get('total_steps', 0)}\n"
+                            f"  平均方向对齐度: {summary.get('avg_cosine_similarity', 0):.4f}\n"
+                            f"  完美对齐比例: {summary.get('perfect_alignment_ratio', 0):.2%}\n"
+                            f"  正向对齐比例: {summary.get('positive_alignment_ratio', 0):.2%}"
+                        )
+
+
+
+
                     # 进度条显示
                     loss_length = self.total_loss.shape[0] if len(self.total_loss.shape) else 1
                     display_unsup = unsupervise_loss_val if compute_unsupervised else 0.0
@@ -749,7 +1503,19 @@ class DetectionTrainer:
                 if hasattr(self.scheduler, 'last_epoch'):
                     self.scheduler.last_epoch = epoch
                 self.stop |= epoch >= self.epochs
-
+              # === [关键新增] 绘制优化器内部状态曲线 ===
+            # 在此处调用 plot_optimization_curves 以生成详细的优化动力学图表
+            # 包括：损失下降、梯度-更新方向对齐度、参数范数变化、MuSGD特有对比
+            if hasattr(self, 'optimization_logs') and self.optimization_logs.get("steps"):
+                LOGGER.info("正在生成优化器内部状态分析图 (Optimization Curves)...")
+                self.plot_optimization_curves()
+                
+                # 可选：打印统计摘要到日志
+                summary = self.get_optimization_summary()
+                if summary:
+                    LOGGER.info(f"优化过程统计摘要: {summary}")
+            else:
+                LOGGER.warning("未找到优化记录数据，跳过优化曲线绘制。")
             self._clear_memory()
             if self.stop:
                 break
@@ -1015,7 +1781,13 @@ class DetectionTrainer:
         """将训练指标保存到 CSV 文件。"""
         keys, vals = list(metrics.keys()), list(metrics.values())
         n = len(metrics) + 2  # 列数
-        s = "" if self.csv.exists() else (("%%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # 头部
+        # 原意是生成 "%s,%s,%s..." 然后填入数据
+# 错误点在于 %%s 变成了字面量，导致后面 % tuple 失效
+# 修正如下：
+        if self.csv.exists():
+            s = ""
+        else:
+            s = ",".join(["epoch", "time"] + keys) + "\n"
         t = time.time() - self.train_time_start  # 计算经过时间
         with open(self.csv, "a") as f:
             f.write(s + ("%.6g," * n % tuple([self.epoch + 1, t] + vals)).rstrip(",") + "\n")  # 写入数据
